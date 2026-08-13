@@ -1,0 +1,23 @@
+name: Windows tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile
+        run: py -m compileall -q scripts tests
+      - name: Unit tests
+        run: py -m unittest discover -s tests -v
+      - name: Self-test source entry point
+        run: py scripts/simple_sync_gui.py --self-test

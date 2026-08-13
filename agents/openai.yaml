@@ -1,0 +1,4 @@
+interface:
+  display_name: "cross-device-agent-sync"
+  short_description: "Sync agent workspaces, chats, and custom files"
+  default_prompt: "Compare two agent endpoints, select chats or custom files, create a private sync package, preserve conflicts, and verify the restore."

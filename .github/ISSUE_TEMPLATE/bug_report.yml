@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible CrossDeviceAgentSync problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Application version
+      placeholder: 1.0.0
+    validations:
+      required: true
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: Workflow
+      options:
+        - Provider reassignment
+        - Provider copy
+        - Computer transfer
+        - Custom-file synchronization
+        - Backup restore
+        - Reference update review
+        - Application update
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Do not attach conversations, credentials, tokens, or unredacted personal logs.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+    validations:
+      required: true
+  - type: textarea
+    id: error
+    attributes:
+      label: Exact error and redacted log lines
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety confirmation
+      options:
+        - label: I removed conversations, credentials, tokens, and personal data from this report.
+          required: true
