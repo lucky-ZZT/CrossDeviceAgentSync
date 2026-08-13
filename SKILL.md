@@ -97,7 +97,7 @@ Keep the original branches immutable so the synthesis remains auditable.
 3. For **Reassign ownership**, leave the full-data backup option selected when recovery is required. It copies the selected rollout files and SQLite state and can therefore approach the selected conversation size. Clearing it keeps only temporary rollback data during execution and leaves no restorable backup after success.
 4. Select the source and destination locations, then use the check button before synchronizing.
 5. Double-click a result only when it should be excluded or reselected.
-6. For another computer, export on the old computer and import on the new computer.
+6. For another computer, export on the old computer. On the new computer, first use **Check migration package**, review direct imports, identical skips, and branch/conflict copies, then use **Start import**. The preview must not write target data.
 7. Use Advanced Mode only for explicit endpoint IDs, directions, include/exclude patterns, or manual plan files.
 8. Use **Backup and Restore** to review timestamped Codex backups, open their folders, or restore a selected completed backup. Close Codex before recovery; the recovery operation first creates another safety backup so it can also be undone.
 9. Use **Check Updates** only to compare the running version with CrossDeviceAgentSync's latest stable GitHub Release and read its release notes. The application never inspects reference projects or decides which design changes to adopt.

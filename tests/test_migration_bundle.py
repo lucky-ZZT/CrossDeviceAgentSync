@@ -110,6 +110,17 @@ class MigrationBundleTests(unittest.TestCase):
         self.assertIn(branch_id, migration_bundle.read_session_index(self.right))
         self.assertIn(branch_id, migration_bundle.read_sqlite_threads(self.right, {branch_id}))
 
+    def test_prepare_restore_is_read_only_for_a_missing_target(self):
+        task_id = str(uuid.uuid4())
+        self.write_session(self.left, task_id, "left result")
+        _, bundle = self.create_plan_and_bundle(task_id)
+        missing_target = self.root / "not-created-by-preview"
+
+        prepared = migration_bundle.prepare_restore(bundle, missing_target)
+
+        self.assertFalse(missing_target.exists())
+        self.assertEqual(prepared["operations"][0]["action"], "import")
+
     def test_committed_backup_can_restore_and_restore_can_be_undone(self):
         task_id = str(uuid.uuid4())
         self.write_session(self.left, task_id, "left result")

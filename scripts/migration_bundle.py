@@ -290,8 +290,13 @@ def derive_alternate_id(bundle_id: str, source_id: str, content_hash: str, attem
 def prepare_restore(bundle_path: Path, codex_home: Path) -> dict[str, Any]:
     manifest, payloads = inspect_bundle(bundle_path)
     codex_home = codex_home.expanduser().resolve()
-    codex_home.mkdir(parents=True, exist_ok=True)
-    current = planner.inventory(codex_home, "target-preview")
+    if codex_home.exists() and not codex_home.is_dir():
+        raise ValueError(f"Codex home is not a directory: {codex_home}")
+    current = (
+        planner.inventory(codex_home, "target-preview")
+        if codex_home.is_dir()
+        else {"conversations": []}
+    )
     current_by_id: dict[str, list[dict[str, Any]]] = {}
     for item in current["conversations"]:
         current_by_id.setdefault(item["task_id"], []).append(item)
@@ -787,6 +792,7 @@ def restore_bundle(bundle_path: Path, codex_home: Path, require_codex_closed: bo
     prepared = prepare_restore(bundle_path, codex_home)
     operations = prepared["operations"]
     codex_home = prepared["codex_home"]
+    codex_home.mkdir(parents=True, exist_ok=True)
     descriptor, lock_path = acquire_lock(codex_home)
     backup_root = backup_root_for(codex_home) / (
         dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + prepared["manifest"]["bundle_id"][:8]

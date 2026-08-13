@@ -17,7 +17,7 @@ import session_merge_planner as planner
 
 
 APP_NAME = "Cross-Device Agent Sync"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 
 def default_codex_home() -> str:

@@ -25,7 +25,7 @@ import session_merge_planner as planner
 
 
 APP_NAME = "代理与电脑同步工具"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 
 class SimpleApp(tk.Tk):
@@ -952,16 +952,127 @@ class SimpleApp(tk.Tk):
     def show_import(self):
         self.clear()
         self.nav()
-        self.title_block("导入到新电脑", "选择旧电脑生成的迁移包和目标位置。")
+        self.title_block("导入到新电脑", "先检查迁移包和现有对话，再决定是否写入。")
         self.import_bundle = tk.StringVar()
         self.import_target = tk.StringVar(value=str(Path.home() / ".codex"))
+        self.import_preview = None
+        self.import_checking = False
+        self.importing = False
         self.file_row(self.content, "迁移包", self.import_bundle)
         self.path_row(self.content, "导入位置", self.import_target)
-        ttk.Button(self.content, text="检查并导入", command=self.import_transfer).pack(anchor="w", pady=18)
+        controls = ttk.Frame(self.content)
+        controls.pack(fill="x", pady=(10, 10))
+        self.import_check_button = ttk.Button(controls, text="检查迁移包", command=self.check_import_transfer)
+        self.import_check_button.pack(side="left")
+        self.import_execute_button = ttk.Button(
+            controls, text="开始导入", command=self.import_transfer, state="disabled"
+        )
+        self.import_execute_button.pack(side="left", padx=8)
+        detail_frame = ttk.LabelFrame(self.content, text="导入预览", padding=8)
+        detail_frame.pack(fill="both", expand=True, pady=(4, 0))
+        self.import_preview_detail = tk.Text(
+            detail_frame, wrap="word", height=15, font=("Microsoft YaHei UI", 10), padx=8, pady=8
+        )
+        detail_scroll = ttk.Scrollbar(detail_frame, orient="vertical", command=self.import_preview_detail.yview)
+        self.import_preview_detail.configure(yscrollcommand=detail_scroll.set)
+        self.import_preview_detail.pack(side="left", fill="both", expand=True)
+        detail_scroll.pack(side="right", fill="y")
+        self.set_import_preview_detail("尚未检查。检查不会创建备份、目录或对话文件。")
+        self.import_bundle.trace_add("write", self.invalidate_import_preview)
+        self.import_target.trace_add("write", self.invalidate_import_preview)
+
+    def set_import_preview_detail(self, text):
+        self.import_preview_detail.configure(state="normal")
+        self.import_preview_detail.delete("1.0", "end")
+        self.import_preview_detail.insert("1.0", text)
+        self.import_preview_detail.configure(state="disabled")
+
+    def invalidate_import_preview(self, *_args):
+        self.import_preview = None
+        if hasattr(self, "import_execute_button"):
+            self.import_execute_button.configure(state="disabled")
+        if hasattr(self, "import_preview_detail"):
+            self.set_import_preview_detail("迁移包或导入位置已改变，请重新检查。尚未写入任何数据。")
+
+    def check_import_transfer(self):
+        self.import_preview = None
+        self.import_execute_button.configure(state="disabled")
+        self.import_checking = True
+        self.import_check_button.configure(state="disabled")
+
+        def operation():
+            bundle = Path(self.import_bundle.get()).expanduser().resolve()
+            target = Path(self.import_target.get()).expanduser().resolve()
+            if not bundle.is_file():
+                raise ValueError(f"迁移包不存在：{bundle}")
+            with zipfile.ZipFile(bundle, "r") as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+            if manifest.get("kind") == migration_bundle.BUNDLE_KIND:
+                prepared = migration_bundle.prepare_restore(bundle, target)
+                return {
+                    "kind": "codex",
+                    "bundle": str(bundle),
+                    "target": str(prepared["codex_home"]),
+                    "operations": prepared["operations"],
+                }
+            if manifest.get("kind") == f"{generic_sync.KIND}-bundle":
+                prepared = generic_sync.prepare_restore(bundle, target)
+                return {
+                    "kind": "generic",
+                    "bundle": str(bundle),
+                    "target": str(prepared["target_root"]),
+                    "operations": prepared["operations"],
+                }
+            raise ValueError("不支持的迁移包类型")
+
+        self.run("正在检查迁移包，尚未写入数据...", operation, self.show_import_preview)
+
+    def show_import_preview(self, preview):
+        self.import_checking = False
+        self.import_check_button.configure(state="normal")
+        self.import_preview = preview
+        operations = preview["operations"]
+        imported = [item for item in operations if item["action"] == "import"]
+        skipped = [item for item in operations if item["action"] == "skip_identical"]
+        conflicts = [item for item in operations if item["action"] in {"import_as_alternate_branch", "copy_as_conflict"}]
+        kind_label = "Codex 对话" if preview["kind"] == "codex" else "自定义文件"
+        lines = [
+            "检查完成，尚未写入任何数据。",
+            "",
+            f"类型：{kind_label}",
+            f"导入位置：{preview['target']}",
+            f"直接导入：{len(imported)} 项",
+            f"完全相同，跳过：{len(skipped)} 项",
+        ]
+        if preview["kind"] == "codex":
+            lines.append(f"同 ID 内容不同，保留两份并新建迁移分支：{len(conflicts)} 项")
+        else:
+            lines.append(f"同路径内容不同，保留原文件并另存冲突副本：{len(conflicts)} 项")
+        if conflicts:
+            lines.extend(["", "需要保留两份的项目："])
+            for item in conflicts[:50]:
+                name = item.get("title") or item.get("source_path") or item.get("path")
+                lines.append(f"- {name}")
+            if len(conflicts) > 50:
+                lines.append(f"- 另有 {len(conflicts) - 50} 项未展开")
+        lines.extend([
+            "",
+            "开始导入前，Codex 必须完全关闭。执行时会再次按相同安全规则检查，并创建可恢复备份。",
+        ])
+        self.set_import_preview_detail("\n".join(lines))
+        self.import_execute_button.configure(state="normal")
+        self.status.set("检查完成，请确认预览后开始导入")
 
     def import_transfer(self):
-        if not messagebox.askyesno(APP_NAME, "导入前会自动备份。导入 Codex 对话时必须完全关闭 Codex。\n\n继续？"):
+        if not self.import_preview:
+            messagebox.showwarning(APP_NAME, "请先检查迁移包。")
             return
+        if not messagebox.askyesno(APP_NAME, "确认预览无误后才会开始导入。\n\n导入前会自动创建可恢复备份；Codex 必须完全关闭。\n\n继续？"):
+            return
+        self.importing = True
+        self.import_check_button.configure(state="disabled")
+        self.import_execute_button.configure(state="disabled")
+
         def operation():
             bundle = Path(self.import_bundle.get())
             with zipfile.ZipFile(bundle, "r") as archive:
@@ -969,7 +1080,13 @@ class SimpleApp(tk.Tk):
             if manifest.get("kind") == migration_bundle.BUNDLE_KIND:
                 return migration_bundle.restore_bundle(bundle, Path(self.import_target.get()), require_codex_closed=True)
             return generic_sync.restore_bundle(bundle, Path(self.import_target.get()))
-        self.run("正在备份并导入...", operation, lambda result: messagebox.showinfo(APP_NAME, f"导入完成。\n备份位置：{result['backup_path']}"))
+        self.run("正在备份并导入...", operation, self.complete_import_transfer)
+
+    def complete_import_transfer(self, result):
+        self.importing = False
+        self.import_check_button.configure(state="normal")
+        self.invalidate_import_preview()
+        messagebox.showinfo(APP_NAME, f"导入完成。\n备份位置：{result['backup_path']}")
 
     def choose_dir(self, variable):
         value = filedialog.askdirectory(initialdir=variable.get() or str(Path.home()))
@@ -1049,6 +1166,14 @@ class SimpleApp(tk.Tk):
         self.close_progress_flow(progress_flow)
         if progress_flow and hasattr(self, "provider_execute_button"):
             self.provider_execute_button.configure(state="normal")
+        if getattr(self, "import_checking", False):
+            self.import_checking = False
+            self.import_check_button.configure(state="normal")
+        if getattr(self, "importing", False):
+            self.importing = False
+            self.import_check_button.configure(state="normal")
+            if self.import_preview:
+                self.import_execute_button.configure(state="normal")
         self.status.set("失败")
         log_path = self.write_diagnostic_log(error, trace)
         log_note = f"\n\n诊断日志：\n{log_path}" if log_path else ""

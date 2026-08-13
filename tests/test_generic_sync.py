@@ -62,6 +62,27 @@ class GenericSyncTests(unittest.TestCase):
         self.assertEqual(plan["summary"]["conflicts"], 1)
         self.assertEqual(plan["entries"][0]["action"], "copy_left_as_conflict")
 
+    def test_prepare_restore_previews_conflicts_without_writing(self):
+        (self.left / "shared.txt").write_text("left", encoding="utf-8")
+        (self.right / "shared.txt").write_text("right", encoding="utf-8")
+        left = generic_sync.snapshot(self.left, "agent-a", "**/*", "")
+        empty = self.root / "empty"
+        empty.mkdir()
+        right = generic_sync.snapshot(empty, "agent-b", "**/*", "")
+        plan = generic_sync.compare(left, right, "left-to-right")
+        left_snapshot = self.root / "left.json"
+        plan_path = self.root / "plan.json"
+        planner.write_json(left_snapshot, left)
+        planner.write_json(plan_path, plan)
+        bundle = self.root / "bundle.zip"
+        generic_sync.create_bundle(left_snapshot, plan_path, "left", bundle)
+
+        prepared = generic_sync.prepare_restore(bundle, self.right)
+
+        self.assertEqual(prepared["operations"][0]["action"], "copy_as_conflict")
+        self.assertEqual((self.right / "shared.txt").read_text(encoding="utf-8"), "right")
+        self.assertFalse((self.right / ".cross-device-agent-sync-backups").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

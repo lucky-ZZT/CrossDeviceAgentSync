@@ -270,39 +270,73 @@ def conflict_path(root: Path, relative: str, endpoint: str, digest: str, attempt
     return (root / source.parent / f"{stem}{tag}{suffix}").resolve()
 
 
-def restore_bundle(bundle_path: Path, target_root: Path, require_empty_lock: bool = True) -> dict[str, Any]:
+def prepare_restore(bundle_path: Path, target_root: Path) -> dict[str, Any]:
     manifest, payloads = inspect_bundle(bundle_path)
     target_root = target_root.expanduser().resolve()
+    if target_root.exists() and not target_root.is_dir():
+        raise ValueError(f"Target root is not a directory: {target_root}")
+    operations = []
+    for file in manifest["files"]:
+        relative = file["path"]
+        target = (target_root / PurePosixPath(relative)).resolve()
+        if not target.is_relative_to(target_root):
+            raise ValueError(f"Target escaped endpoint root: {relative}")
+        data = payloads[file["payload"]]
+        if target.is_file() and planner.sha256_bytes(target.read_bytes()) == file["content_hash"]:
+            operations.append({
+                "path": relative,
+                "source_path": relative,
+                "payload": file["payload"],
+                "target_path": str(target),
+                "action": "skip_identical",
+            })
+            continue
+        if target.exists():
+            destination = conflict_path(target_root, relative, manifest["source_endpoint_id"], file["content_hash"])
+            attempt = 0
+            while destination.exists():
+                if destination.is_file() and planner.sha256_bytes(destination.read_bytes()) == file["content_hash"]:
+                    break
+                attempt += 1
+                destination = conflict_path(target_root, relative, manifest["source_endpoint_id"], file["content_hash"], attempt)
+            target = destination
+            action = "copy_as_conflict"
+        else:
+            action = "import"
+        operations.append({
+            "path": str(target.relative_to(target_root)).replace("\\", "/"),
+            "source_path": relative,
+            "payload": file["payload"],
+            "target_path": str(target),
+            "action": action,
+        })
+    return {
+        "manifest": manifest,
+        "payloads": payloads,
+        "target_root": target_root,
+        "operations": operations,
+    }
+
+
+def restore_bundle(bundle_path: Path, target_root: Path, require_empty_lock: bool = True) -> dict[str, Any]:
+    prepared = prepare_restore(bundle_path, target_root)
+    manifest = prepared["manifest"]
+    payloads = prepared["payloads"]
+    target_root = prepared["target_root"]
     target_root.mkdir(parents=True, exist_ok=True)
     lock = target_root / ".cross-device-agent-sync.lock"
     descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY) if require_empty_lock else None
     backup_root = target_root / ".cross-device-agent-sync-backups" / (dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + manifest["bundle_id"][:8])
     created = []
     backups = []
-    operations = []
+    operations = prepared["operations"]
     try:
         backup_root.mkdir(parents=True, exist_ok=False)
-        for file in manifest["files"]:
-            relative = file["path"]
-            target = (target_root / PurePosixPath(relative)).resolve()
-            if not target.is_relative_to(target_root):
-                raise ValueError(f"Target escaped endpoint root: {relative}")
-            data = payloads[file["payload"]]
-            if target.is_file() and planner.sha256_bytes(target.read_bytes()) == file["content_hash"]:
-                operations.append({"path": relative, "action": "skip_identical"})
+        for operation in operations:
+            if operation["action"] == "skip_identical":
                 continue
-            if target.exists():
-                destination = conflict_path(target_root, relative, manifest["source_endpoint_id"], file["content_hash"])
-                attempt = 0
-                while destination.exists():
-                    if destination.is_file() and planner.sha256_bytes(destination.read_bytes()) == file["content_hash"]:
-                        break
-                    attempt += 1
-                    destination = conflict_path(target_root, relative, manifest["source_endpoint_id"], file["content_hash"], attempt)
-                target = destination
-                action = "copy_as_conflict"
-            else:
-                action = "import"
+            target = Path(operation["target_path"])
+            data = payloads[operation["payload"]]
             if target.is_file():
                 backup = backup_root / "files" / target.relative_to(target_root)
                 backup.parent.mkdir(parents=True, exist_ok=True)
@@ -314,7 +348,6 @@ def restore_bundle(bundle_path: Path, target_root: Path, require_empty_lock: boo
             temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
             temporary.write_bytes(data)
             os.replace(temporary, target)
-            operations.append({"path": str(target.relative_to(target_root)).replace("\\", "/"), "action": action})
         (backup_root / "transaction.json").write_text(json.dumps({"status": "committed", "bundle_id": manifest["bundle_id"], "operations": operations}, indent=2), encoding="utf-8")
         return {"bundle_id": manifest["bundle_id"], "backup_path": str(backup_root), "operations": operations}
     except Exception:

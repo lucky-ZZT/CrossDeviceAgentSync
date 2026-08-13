@@ -35,8 +35,10 @@ On the new computer:
 1. Close Codex.
 2. Open **Transfer to another computer** and select **Import**.
 3. Choose the package and target directory.
-4. Confirm the preview and import.
-5. Verify imported conversations before deleting the package.
+4. Click **Check migration package**. This is read-only and shows direct imports, identical skips, and conflicts.
+5. Review every conflict. Same-ID conversations with different content stay on the new computer and the incoming conversation is added as a separate migrated branch.
+6. Click **Start import** only after confirming the preview.
+7. Verify imported conversations before deleting the package.
 
 ## Synchronize Custom Files
 

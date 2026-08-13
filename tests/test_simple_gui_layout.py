@@ -91,6 +91,16 @@ class SimpleGuiLayoutTests(unittest.TestCase):
         self.assertNotIn("软件更新", labels)
         self.assertNotIn("参考项目更新审查", labels)
 
+    def test_import_requires_a_check_before_starting(self):
+        self.app.show_import()
+        self._assert_buttons_visible({"检查迁移包", "开始导入"})
+        buttons = {
+            child.cget("text"): child
+            for child in self._walk(self.app)
+            if child.winfo_class() == "TButton"
+        }
+        self.assertEqual(str(buttons["开始导入"].cget("state")), "disabled")
+
 
 if __name__ == "__main__":
     unittest.main()

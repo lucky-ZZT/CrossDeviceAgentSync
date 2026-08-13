@@ -19,7 +19,7 @@ Portable Windows tool for selectively synchronizing Codex conversations, local P
 
 Download `CrossDeviceAgentSync-vX.Y.Z.exe` from [Releases](../../releases). No Python installation is required.
 
-Close Codex before migrations, Provider writes, imports, or restores. Run the preflight check first and retain full backups whenever recovery may be required.
+Close Codex before migrations, Provider writes, imports, or restores. For a cross-device import, first use **Check migration package** to review direct imports, identical skips, and preserved conflict copies; it does not write target data. Retain full backups whenever recovery may be required.
 
 See [docs/USER-GUIDE.md](docs/USER-GUIDE.md) for the complete workflow and safety rules.
 
