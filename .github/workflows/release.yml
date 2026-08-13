@@ -1,0 +1,37 @@
+name: Publish release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate version and artifact
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          grep -Fq "APP_VERSION = \"${version}\"" scripts/simple_sync_gui.py
+          grep -Fq "APP_VERSION = \"${version}\"" scripts/cross_device_agent_sync_gui.py
+          test -f "assets/CrossDeviceAgentSync-v${version}.exe"
+          (cd assets && sha256sum -c SHA256SUMS.txt)
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          gh release create "${GITHUB_REF_NAME}" \
+            "assets/CrossDeviceAgentSync-v${version}.exe" \
+            "assets/SHA256SUMS.txt" \
+            --verify-tag \
+            --title "CrossDeviceAgentSync ${GITHUB_REF_NAME}" \
+            --notes-file .github/RELEASE_NOTES.md
