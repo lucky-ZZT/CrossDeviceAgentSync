@@ -31,7 +31,7 @@ from PIL import Image, ImageTk
 
 
 APP_NAME = "代理与电脑同步工具"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 
 def format_backup_created_at(value: str, fallback: str = "", timezone=None) -> str:
@@ -695,6 +695,48 @@ class SimpleApp(tk.Tk):
             flow["progressbar"].stop()
             window.grab_release()
             window.destroy()
+
+    def start_data_progress(self, title, steps):
+        window = tk.Toplevel(self)
+        window.title(title)
+        window.transient(self)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", lambda: None)
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=title, font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="请保持软件打开，操作完成前不要启动或使用 Codex。", foreground="#9A5B00").pack(
+            anchor="w", pady=(2, 12)
+        )
+        labels = {}
+        for key, text in steps:
+            label = ttk.Label(frame, text=f"等待  {text}")
+            label.pack(anchor="w", pady=2)
+            labels[key] = label
+        detail = tk.StringVar(value="正在准备...")
+        ttk.Separator(frame).pack(fill="x", pady=(12, 8))
+        ttk.Label(frame, textvariable=detail, wraplength=560).pack(anchor="w", fill="x")
+        progressbar = ttk.Progressbar(frame, mode="indeterminate", length=560)
+        progressbar.pack(fill="x", pady=(10, 0))
+        progressbar.start(12)
+        window.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - window.winfo_reqwidth()) // 2)
+        y = self.winfo_rooty() + max(0, (self.winfo_height() - window.winfo_reqheight()) // 2)
+        window.geometry(f"+{x}+{y}")
+        window.grab_set()
+        return {"window": window, "steps": steps, "labels": labels, "detail": detail, "progressbar": progressbar}
+
+    def update_data_progress(self, flow, stage, detail):
+        window = flow["window"]
+        if not window.winfo_exists():
+            return
+        order = [key for key, _text in flow["steps"]]
+        current_index = len(order) if stage in {"complete", "finalize"} else order.index(stage) if stage in order else 0
+        for index, (key, text) in enumerate(flow["steps"]):
+            prefix = "完成" if index < current_index else "进行中" if index == current_index else "等待"
+            flow["labels"][key].configure(text=f"{prefix}  {text}")
+        flow["detail"].set(detail)
+        self.status.set(detail)
 
     def handoff_local_threads(self):
         target_provider = self.target_agent.get().strip()
@@ -2268,23 +2310,33 @@ class SimpleApp(tk.Tk):
         self.export_output = tk.StringVar(value=str(Path.home() / "Desktop" / "agent-transfer.cdas.zip"))
         self.path_row(self.content, "要导出的目录", self.export_source)
         self.path_row(self.content, "保存迁移包", self.export_output, save=True)
-        ttk.Button(self.content, text="开始导出", command=self.export_transfer).pack(anchor="w", pady=18)
+        self.export_button = ttk.Button(self.content, text="开始导出", command=self.export_transfer)
+        self.export_button.pack(anchor="w", pady=18)
 
     def export_transfer(self):
-        def operation():
+        if getattr(self, "exporting", False):
+            return
+        self.exporting = True
+        self.export_button.configure(state="disabled")
+        flow = self.start_data_progress(
+            "导出迁移包进度",
+            (("scan", "扫描并分析对话"), ("metadata", "读取迁移元数据"), ("package", "流式生成迁移包"), ("finalize", "完成并校验迁移包")),
+        )
+
+        def operation(progress):
             source = Path(self.export_source.get())
             output = Path(self.export_output.get())
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 if self.export_type.get() == "codex":
-                    left = planner.inventory(source, "old-computer")
+                    left = planner.inventory(source, "old-computer", progress_callback=progress)
                     right = {"schema_version": 1, "kind": "cross-device-agent-sync-inventory", "device_id": "new-computer", "codex_home": "", "generated_at": "", "conversations": []}
                     right["inventory_hash"] = planner.sha256_bytes(planner.canonical_json({"device_id": right["device_id"], "conversations": []}))
                     plan = planner.compare_inventories(left, right, "left-to-right", set(), set())
                     left_path, plan_path = root / "left.json", root / "plan.json"
                     planner.write_json(left_path, left)
                     planner.write_json(plan_path, plan)
-                    return migration_bundle.create_bundle(left_path, plan_path, "left", output)
+                    return migration_bundle.create_bundle(left_path, plan_path, "left", output, progress_callback=progress)
                 left = generic_sync.snapshot(source, "old-computer")
                 empty = root / "empty"
                 empty.mkdir()
@@ -2293,8 +2345,16 @@ class SimpleApp(tk.Tk):
                 left_path, plan_path = root / "left.json", root / "plan.json"
                 planner.write_json(left_path, left)
                 planner.write_json(plan_path, plan)
-                return generic_sync.create_bundle(left_path, plan_path, "left", output)
-        self.run("正在生成迁移包...", operation, lambda result: messagebox.showinfo(APP_NAME, f"迁移包已生成：\n{result['bundle_path']}"))
+                return generic_sync.create_bundle(left_path, plan_path, "left", output, progress_callback=progress)
+        self.run(
+            "正在生成迁移包...",
+            operation,
+            lambda result: messagebox.showinfo(APP_NAME, f"迁移包已生成：\n{result['bundle_path']}"),
+            progress_flow=flow,
+            progress_callback=lambda stage, detail: self.post_ui_event(
+                lambda: self.update_data_progress(flow, stage, detail)
+            ),
+        )
 
     def show_import(self):
         self.clear()
@@ -2342,12 +2402,18 @@ class SimpleApp(tk.Tk):
             self.set_import_preview_detail("迁移包或导入位置已改变，请重新检查。尚未写入任何数据。")
 
     def check_import_transfer(self):
+        if getattr(self, "import_checking", False) or getattr(self, "importing", False):
+            return
         self.import_preview = None
         self.import_execute_button.configure(state="disabled")
         self.import_checking = True
         self.import_check_button.configure(state="disabled")
+        flow = self.start_data_progress(
+            "检查迁移包进度",
+            (("validate", "校验迁移包"), ("scan", "扫描新电脑现有对话"), ("compare", "比较冲突和重复"), ("finalize", "生成导入预览")),
+        )
 
-        def operation():
+        def operation(progress):
             bundle = Path(self.import_bundle.get()).expanduser().resolve()
             target = Path(self.import_target.get()).expanduser().resolve()
             if not bundle.is_file():
@@ -2355,7 +2421,7 @@ class SimpleApp(tk.Tk):
             with zipfile.ZipFile(bundle, "r") as archive:
                 manifest = json.loads(archive.read("manifest.json"))
             if manifest.get("kind") == migration_bundle.BUNDLE_KIND:
-                prepared = migration_bundle.prepare_restore(bundle, target)
+                prepared = migration_bundle.prepare_restore(bundle, target, progress_callback=progress)
                 return {
                     "kind": "codex",
                     "bundle": str(bundle),
@@ -2363,7 +2429,7 @@ class SimpleApp(tk.Tk):
                     "operations": prepared["operations"],
                 }
             if manifest.get("kind") == f"{generic_sync.KIND}-bundle":
-                prepared = generic_sync.prepare_restore(bundle, target)
+                prepared = generic_sync.prepare_restore(bundle, target, progress_callback=progress)
                 return {
                     "kind": "generic",
                     "bundle": str(bundle),
@@ -2372,7 +2438,15 @@ class SimpleApp(tk.Tk):
                 }
             raise ValueError("不支持的迁移包类型")
 
-        self.run("正在检查迁移包，尚未写入数据...", operation, self.show_import_preview)
+        self.run(
+            "正在检查迁移包，尚未写入数据...",
+            operation,
+            self.show_import_preview,
+            progress_flow=flow,
+            progress_callback=lambda stage, detail: self.post_ui_event(
+                lambda: self.update_data_progress(flow, stage, detail)
+            ),
+        )
 
     def show_import_preview(self, preview):
         self.import_checking = False
@@ -2419,15 +2493,31 @@ class SimpleApp(tk.Tk):
         self.importing = True
         self.import_check_button.configure(state="disabled")
         self.import_execute_button.configure(state="disabled")
+        flow = self.start_data_progress(
+            "导入迁移包进度",
+            (("preflight", "检查迁移包和目标数据"), ("validate", "校验迁移包内容"), ("backup", "备份新电脑现有数据"), ("write", "写入选中的对话"), ("verify", "验证导入结果")),
+        )
 
-        def operation():
+        def operation(progress):
             bundle = Path(self.import_bundle.get())
             with zipfile.ZipFile(bundle, "r") as archive:
                 manifest = json.loads(archive.read("manifest.json"))
             if manifest.get("kind") == migration_bundle.BUNDLE_KIND:
-                return migration_bundle.restore_bundle(bundle, Path(self.import_target.get()), require_codex_closed=True)
-            return generic_sync.restore_bundle(bundle, Path(self.import_target.get()))
-        self.run("正在备份并导入...", operation, self.complete_import_transfer)
+                return migration_bundle.restore_bundle(
+                    bundle, Path(self.import_target.get()), require_codex_closed=True, progress_callback=progress
+                )
+            return generic_sync.restore_bundle(
+                bundle, Path(self.import_target.get()), progress_callback=progress
+            )
+        self.run(
+            "正在备份并导入...",
+            operation,
+            self.complete_import_transfer,
+            progress_flow=flow,
+            progress_callback=lambda stage, detail: self.post_ui_event(
+                lambda: self.update_data_progress(flow, stage, detail)
+            ),
+        )
 
     def complete_import_transfer(self, result):
         self.importing = False
@@ -2466,13 +2556,13 @@ class SimpleApp(tk.Tk):
         if value:
             variable.set(value)
 
-    def run(self, text, operation, callback=None, progress_flow=None):
+    def run(self, text, operation, callback=None, progress_flow=None, progress_callback=None):
         self.status.set(text)
         self.diagnostics.event("operation_start", operation=text)
 
         def worker():
             try:
-                result = operation()
+                result = operation(progress_callback) if progress_callback is not None else operation()
                 self.post_ui_event(
                     lambda result=result, callback=callback, progress_flow=progress_flow: self.finish(
                         result, callback, progress_flow
@@ -2492,6 +2582,10 @@ class SimpleApp(tk.Tk):
         self.close_progress_flow(progress_flow)
         if progress_flow and hasattr(self, "provider_execute_button"):
             self.provider_execute_button.configure(state="normal")
+        if getattr(self, "exporting", False):
+            self.exporting = False
+            if hasattr(self, "export_button") and self.export_button.winfo_exists():
+                self.export_button.configure(state="normal")
         self.status.set("完成")
         summary = None
         if isinstance(result, dict):
@@ -2522,6 +2616,10 @@ class SimpleApp(tk.Tk):
         self.close_progress_flow(progress_flow)
         if progress_flow and hasattr(self, "provider_execute_button"):
             self.provider_execute_button.configure(state="normal")
+        if getattr(self, "exporting", False):
+            self.exporting = False
+            if hasattr(self, "export_button") and self.export_button.winfo_exists():
+                self.export_button.configure(state="normal")
         if getattr(self, "import_checking", False):
             self.import_checking = False
             self.import_check_button.configure(state="normal")

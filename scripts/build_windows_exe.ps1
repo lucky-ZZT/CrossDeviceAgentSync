@@ -11,6 +11,7 @@ $BuildRoot = Join-Path $ProjectRoot ".skill-tests\cross-device-agent-sync-build"
 if (-not $OutputDirectory) {
     $OutputDirectory = Join-Path $SkillRoot "assets"
 }
+$OutputDirectory = [System.IO.Path]::GetFullPath($OutputDirectory)
 
 $ReleaseChecker = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot "app_release_checker.py")
 if (-not $AllowUnconfiguredRepository -and $ReleaseChecker -match 'GITHUB_REPOSITORY\s*=\s*""') {
@@ -29,12 +30,13 @@ py -m PyInstaller `
     --workpath (Join-Path $BuildRoot "work") `
     --specpath (Join-Path $BuildRoot "spec") `
     --paths $PSScriptRoot `
+    --runtime-hook (Join-Path $PSScriptRoot "pyinstaller_runtime_hook.py") `
     $EntryPoint;
 if ($LASTEXITCODE -ne 0) {
     throw "PyInstaller 构建失败，未生成可用 EXE。"
 }
 
-$OutputPath = Join-Path $OutputDirectory "$ApplicationName.exe"
+$OutputPath = [System.IO.Path]::GetFullPath((Join-Path $OutputDirectory "$ApplicationName.exe"))
 if (-not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
     throw "PyInstaller 未生成预期的 EXE：$OutputPath"
 }
@@ -45,7 +47,7 @@ $Version = if ($ApplicationName -match '^CrossDeviceAgentSync-v(?<version>\d+\.\
 }
 if ($Version) {
     Get-ChildItem -LiteralPath $OutputDirectory -Filter "CrossDeviceAgentSync*.exe" -File |
-        Where-Object { $_.FullName -ne $OutputPath } |
+        Where-Object { -not [System.IO.Path]::GetFullPath($_.FullName).Equals($OutputPath, [System.StringComparison]::OrdinalIgnoreCase) } |
         ForEach-Object {
             $OldPath = $_.FullName
             try {

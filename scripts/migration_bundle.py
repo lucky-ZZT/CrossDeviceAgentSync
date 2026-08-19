@@ -15,7 +15,7 @@ import tempfile
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, Callable
 
 import session_merge_planner as planner
 
@@ -26,6 +26,16 @@ BACKUP_SCHEMA_VERSION = 2
 BACKUP_DIR_NAME = "cross-device-sync-backups"
 BACKUP_STREAM_BYTES = 1024 * 1024
 MAX_BACKUP_FIRST_LINE_BYTES = 8 * 1024 * 1024
+BUNDLE_STREAM_BYTES = 1024 * 1024
+BUNDLE_COMPRESSION_LEVEL = 1
+
+
+ProgressCallback = Callable[[str, str], None]
+
+
+def report_progress(callback: ProgressCallback | None, stage: str, detail: str) -> None:
+    if callback is not None:
+        callback(stage, detail)
 
 
 def now_iso() -> str:
@@ -130,7 +140,9 @@ def create_bundle(
     plan_path: Path,
     side: str,
     output_path: Path,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
+    report_progress(progress_callback, "metadata", "正在读取迁移计划和会话索引...")
     inventory = planner.load_inventory(inventory_path)
     plan = load_json(plan_path)
     if plan.get("kind") != "cross-device-agent-sync-plan":
@@ -155,8 +167,8 @@ def create_bundle(
     task_ids = {entry["task_id"] for entry in selected_entries}
     index_rows = read_session_index(codex_home)
     sqlite_rows = read_sqlite_threads(codex_home, task_ids)
-    payloads: dict[str, bytes] = {}
     conversations = []
+    payload_sources: list[tuple[str, Path, str, str]] = []
     for entry in selected_entries:
         task_id = entry["task_id"]
         matches = inventory_by_id.get(task_id, [])
@@ -166,11 +178,8 @@ def create_bundle(
         source_path = (codex_home / PurePosixPath(item["relative_path"])).resolve()
         if not source_path.is_file() or not source_path.is_relative_to(codex_home.resolve()):
             raise ValueError(f"Session source is missing or outside Codex home: {source_path}")
-        data = source_path.read_bytes()
-        if planner.sha256_bytes(data) != item["content_hash"]:
-            raise ValueError(f"Session changed after inventory: {task_id}. Rescan before packaging")
         payload_name = f"sessions/{task_id}.jsonl"
-        payloads[payload_name] = data
+        payload_sources.append((payload_name, source_path, item["content_hash"], task_id))
         branch_action = "branch" in entry["safe_default_action"] or entry["safe_default_action"] == "exchange_as_branches"
         target_task_id = entry.get(f"proposed_{side}_branch_id") if branch_action else task_id
         conversations.append({
@@ -196,16 +205,51 @@ def create_bundle(
         "source_inventory_hash": inventory["inventory_hash"],
         "plan_id": plan["plan_id"],
         "conversations": conversations,
-        "payload_checksums": {name: planner.sha256_bytes(data) for name, data in payloads.items()},
+        "payload_checksums": {name: checksum for name, _path, checksum, _task_id in payload_sources},
     }
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
-    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        archive.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
-        for name, data in payloads.items():
-            archive.writestr(name, data)
-    os.replace(temporary, output_path)
+    total_bytes = sum(source.stat().st_size for _name, source, _checksum, _task_id in payload_sources)
+    completed_bytes = 0
+    try:
+        with zipfile.ZipFile(
+            temporary,
+            "w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=BUNDLE_COMPRESSION_LEVEL,
+            allowZip64=True,
+        ) as archive:
+            for index, (name, source, expected_hash, task_id) in enumerate(payload_sources, start=1):
+                initial = source.stat()
+                digest = hashlib.sha256()
+                report_progress(
+                    progress_callback,
+                    "package",
+                    f"正在压缩对话 {index}/{len(payload_sources)}：{task_id}（{initial.st_size / (1024 * 1024):.1f} MB）",
+                )
+                with source.open("rb") as reader, archive.open(name, "w", force_zip64=True) as writer:
+                    while chunk := reader.read(BUNDLE_STREAM_BYTES):
+                        digest.update(chunk)
+                        writer.write(chunk)
+                        completed_bytes += len(chunk)
+                        report_progress(
+                            progress_callback,
+                            "package",
+                            f"正在生成迁移包：{completed_bytes / (1024 * 1024):.1f}/"
+                            f"{total_bytes / (1024 * 1024):.1f} MB，"
+                            f"对话 {index}/{len(payload_sources)}",
+                        )
+                latest = source.stat()
+                if digest.hexdigest() != expected_hash:
+                    raise ValueError(f"Session changed after inventory: {task_id}. Rescan before packaging")
+                if latest.st_size != initial.st_size or latest.st_mtime_ns != initial.st_mtime_ns:
+                    raise ValueError(f"Session changed while packaging: {task_id}. Rescan before packaging")
+            report_progress(progress_callback, "finalize", "正在写入清单并完成迁移包...")
+            archive.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return {
         "bundle_path": str(output_path),
         "bundle_id": manifest["bundle_id"],
@@ -214,7 +258,11 @@ def create_bundle(
     }
 
 
-def inspect_bundle(bundle_path: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
+def inspect_bundle(
+    bundle_path: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    report_progress(progress_callback, "validate", "正在读取并验证迁移包清单...")
     with zipfile.ZipFile(bundle_path, "r") as archive:
         names = archive.namelist()
         if "manifest.json" not in names or len(names) > 10002:
@@ -230,8 +278,26 @@ def inspect_bundle(bundle_path: Path) -> tuple[dict[str, Any], dict[str, bytes]]
         if set(names) != {"manifest.json", *expected.keys()}:
             raise ValueError("Bundle entries do not match the manifest")
         payloads = {}
-        for name, checksum in expected.items():
-            data = archive.read(name)
+        total_bytes = sum(int(info.file_size) for info in (archive.getinfo(name) for name in expected))
+        completed_bytes = 0
+        for index, (name, checksum) in enumerate(expected.items(), start=1):
+            report_progress(
+                progress_callback,
+                "validate",
+                f"正在校验迁移包中的对话 {index}/{len(expected)}...",
+            )
+            data_parts: list[bytes] = []
+            with archive.open(name, "r") as stream:
+                while chunk := stream.read(BUNDLE_STREAM_BYTES):
+                    data_parts.append(chunk)
+                    completed_bytes += len(chunk)
+                    report_progress(
+                        progress_callback,
+                        "validate",
+                        f"正在校验迁移包：{completed_bytes / (1024 * 1024):.1f}/"
+                        f"{total_bytes / (1024 * 1024):.1f} MB，文件 {index}/{len(expected)}",
+                    )
+            data = b"".join(data_parts)
             if planner.sha256_bytes(data) != checksum:
                 raise ValueError(f"Bundle checksum failed: {name}")
             payloads[name] = data
@@ -287,13 +353,17 @@ def derive_alternate_id(bundle_id: str, source_id: str, content_hash: str, attem
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"{BUNDLE_KIND}:{bundle_id}:{source_id}:{content_hash}:{attempt}"))
 
 
-def prepare_restore(bundle_path: Path, codex_home: Path) -> dict[str, Any]:
-    manifest, payloads = inspect_bundle(bundle_path)
+def prepare_restore(
+    bundle_path: Path,
+    codex_home: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    manifest, payloads = inspect_bundle(bundle_path, progress_callback=progress_callback)
     codex_home = codex_home.expanduser().resolve()
     if codex_home.exists() and not codex_home.is_dir():
         raise ValueError(f"Codex home is not a directory: {codex_home}")
     current = (
-        planner.inventory(codex_home, "target-preview")
+        planner.inventory(codex_home, "target-preview", progress_callback=progress_callback)
         if codex_home.is_dir()
         else {"conversations": []}
     )
@@ -303,17 +373,24 @@ def prepare_restore(bundle_path: Path, codex_home: Path) -> dict[str, Any]:
 
     operations = []
     reserved = set(current_by_id)
-    for conversation in manifest["conversations"]:
+    for index, conversation in enumerate(manifest["conversations"], start=1):
+        report_progress(
+            progress_callback,
+            "compare",
+            f"正在比较对话 {index}/{len(manifest['conversations'])}：{conversation['source_task_id']}",
+        )
         source_id = conversation["source_task_id"]
         target_id = conversation["target_task_id"]
         data = payloads[conversation["payload"]]
         suffix = " [migrated branch]" if target_id != source_id else ""
-        rewritten = rewrite_jsonl(data, source_id, target_id, suffix)
+        identity_copy = target_id == source_id and not suffix
+        rewritten = data if identity_copy else rewrite_jsonl(data, source_id, target_id, suffix)
+        rewritten_hash = conversation["content_hash"] if identity_copy else planner.sha256_bytes(rewritten)
         matches = current_by_id.get(target_id, [])
         if len(matches) > 1:
             raise ValueError(f"Target has duplicate local task ID: {target_id}")
         action = "import"
-        if matches and matches[0]["content_hash"] == planner.sha256_bytes(rewritten):
+        if matches and matches[0]["content_hash"] == rewritten_hash:
             action = "skip_identical"
         elif matches:
             for attempt in range(1000):
@@ -324,6 +401,7 @@ def prepare_restore(bundle_path: Path, codex_home: Path) -> dict[str, Any]:
                     target_id = candidate
                     suffix = " [migrated branch]"
                     rewritten = rewrite_jsonl(data, source_id, target_id, suffix)
+                    rewritten_hash = planner.sha256_bytes(rewritten)
                     action = "import_as_alternate_branch"
                     break
             else:
@@ -340,7 +418,7 @@ def prepare_restore(bundle_path: Path, codex_home: Path) -> dict[str, Any]:
             "action": action,
             "target_path": str(target_path),
             "target_relative_path": relative.as_posix(),
-            "expected_hash": planner.sha256_bytes(rewritten),
+            "expected_hash": rewritten_hash,
             "rewritten_bytes": rewritten,
             "session_index_row": conversation.get("session_index_row"),
             "sqlite_thread_row": conversation.get("sqlite_thread_row"),
@@ -1152,10 +1230,16 @@ def merge_sqlite(codex_home: Path, operations: list[dict[str, Any]]) -> Path | N
         connection.close()
 
 
-def restore_bundle(bundle_path: Path, codex_home: Path, require_codex_closed: bool = True) -> dict[str, Any]:
+def restore_bundle(
+    bundle_path: Path,
+    codex_home: Path,
+    require_codex_closed: bool = True,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
     if require_codex_closed and codex_is_running():
         raise ValueError("Codex is running. Close Codex completely before restoring")
-    prepared = prepare_restore(bundle_path, codex_home)
+    report_progress(progress_callback, "preflight", "正在检查 Codex 状态和迁移包...")
+    prepared = prepare_restore(bundle_path, codex_home, progress_callback=progress_callback)
     operations = prepared["operations"]
     codex_home = prepared["codex_home"]
     codex_home.mkdir(parents=True, exist_ok=True)
@@ -1167,6 +1251,7 @@ def restore_bundle(bundle_path: Path, codex_home: Path, require_codex_closed: bo
     backed_up: list[tuple[Path, Path]] = []
     database = find_state_db(codex_home)
     try:
+        report_progress(progress_callback, "backup", "正在创建新电脑当前数据的可恢复备份...")
         backup_root.mkdir(parents=True, exist_ok=False)
         targets = [Path(operation["target_path"]) for operation in operations if operation["action"] != "skip_identical"]
         index_path = codex_home / "session_index.jsonl"
@@ -1194,9 +1279,14 @@ def restore_bundle(bundle_path: Path, codex_home: Path, require_codex_closed: bo
             bundle_id=prepared["manifest"]["bundle_id"],
         ), indent=2, ensure_ascii=False).encode("utf-8"))
 
-        for operation in operations:
+        for index, operation in enumerate(operations, start=1):
             if operation["action"] == "skip_identical":
                 continue
+            report_progress(
+                progress_callback,
+                "write",
+                f"正在写入对话 {index}/{len(operations)}：{operation['target_task_id']}",
+            )
             target = Path(operation["target_path"])
             if not target.exists():
                 created_files.append(target)
@@ -1204,7 +1294,8 @@ def restore_bundle(bundle_path: Path, codex_home: Path, require_codex_closed: bo
         merge_session_index(codex_home, operations)
         merge_sqlite(codex_home, operations)
 
-        verification = planner.inventory(codex_home, "target-verify")
+        report_progress(progress_callback, "verify", "正在重新扫描并验证导入结果...")
+        verification = planner.inventory(codex_home, "target-verify", progress_callback=progress_callback)
         verified = {item["task_id"]: item for item in verification["conversations"]}
         failures = []
         for operation in operations:
@@ -1233,6 +1324,7 @@ def restore_bundle(bundle_path: Path, codex_home: Path, require_codex_closed: bo
             completed_at=now_iso(),
             imported=sum(op["action"] != "skip_identical" for op in operations),
         ), indent=2, ensure_ascii=False).encode("utf-8"))
+        report_progress(progress_callback, "complete", "导入完成，数据和索引校验通过。")
         return {
             "bundle_id": prepared["manifest"]["bundle_id"],
             "backup_path": str(backup_root),

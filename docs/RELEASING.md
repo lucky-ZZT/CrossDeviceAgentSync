@@ -1,10 +1,12 @@
 # Release Process
 
+The detailed Chinese maintainer workflow, checkpoint behavior, retry rules, and transfer acceptance criteria are documented in `MAINTAINER-RELEASE-GUIDE.zh-CN.md`.
+
 1. Confirm `GITHUB_REPOSITORY` in `scripts/app_release_checker.py` is the final `owner/repository` and update `APP_VERSION` in both GUI entry points.
 2. Update `SKILL.md` and the project design notes.
-3. Run all unit tests, Python compilation, skill validation, and name validation.
+3. Run all unit tests, Python compilation, skill validation, and name validation once against the final source. Do not repeat the same local suite after a version-only edit; GitHub CI provides the independent second pass.
 4. Build the versioned EXE with `scripts/build_windows_exe.ps1`.
-5. Run the EXE with `--self-test`.
+5. Run the built EXE with `--self-test` once. Rebuild only if source, dependencies, or packaging inputs changed.
 6. Confirm `assets/SHA256SUMS.txt` matches the versioned EXE.
 7. Update `.github/RELEASE_NOTES.md` with adopted and rejected changes, impact, tests, version, and SHA-256.
 8. Commit and push the release-ready source and artifacts.

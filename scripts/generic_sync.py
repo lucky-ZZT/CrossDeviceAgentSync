@@ -12,13 +12,19 @@ import shutil
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 import session_merge_planner as planner
 
 
 SCHEMA_VERSION = 1
 KIND = "cross-device-agent-sync-generic"
+ProgressCallback = Callable[[str, str], None]
+
+
+def report_progress(callback: ProgressCallback | None, stage: str, detail: str) -> None:
+    if callback is not None:
+        callback(stage, detail)
 DEFAULT_EXCLUDES = (
     ".git",
     ".svn",
@@ -197,7 +203,9 @@ def create_bundle(
     side: str,
     output_path: Path,
     metadata: dict[str, Any] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
+    report_progress(progress_callback, "metadata", "正在读取文件清单和同步计划...")
     source = load_snapshot(snapshot_path)
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     if plan.get("kind") != f"{KIND}-plan":
@@ -215,7 +223,8 @@ def create_bundle(
     root = Path(source["root"])
     payloads = {}
     files = []
-    for entry in selected:
+    for index, entry in enumerate(selected, start=1):
+        report_progress(progress_callback, "package", f"正在读取文件 {index}/{len(selected)}：{entry['path']}")
         item = source_by_path[entry["path"]]
         path = (root / PurePosixPath(item["path"])).resolve()
         if not path.is_file() or not path.is_relative_to(root):
@@ -247,15 +256,24 @@ def create_bundle(
     output_path = output_path.resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp")
-    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        archive.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
-        for name, data in payloads.items():
-            archive.writestr(name, data)
-    os.replace(temporary, output_path)
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
+            archive.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False) + "\n")
+            for index, (name, data) in enumerate(payloads.items(), start=1):
+                report_progress(progress_callback, "package", f"正在压缩文件 {index}/{len(payloads)}：{name}")
+                archive.writestr(name, data)
+        report_progress(progress_callback, "finalize", "正在完成迁移包...")
+        os.replace(temporary, output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
     return {"bundle_path": str(output_path), "bundle_id": manifest["bundle_id"], "file_count": len(files), "bytes": output_path.stat().st_size}
 
 
-def inspect_bundle(bundle_path: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
+def inspect_bundle(
+    bundle_path: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    report_progress(progress_callback, "validate", "正在读取文件迁移包清单...")
     with zipfile.ZipFile(bundle_path, "r") as archive:
         names = archive.namelist()
         manifest = json.loads(archive.read("manifest.json"))
@@ -265,10 +283,11 @@ def inspect_bundle(bundle_path: Path) -> tuple[dict[str, Any], dict[str, bytes]]
         if set(names) != {"manifest.json", *expected.keys()}:
             raise ValueError("Bundle entries do not match manifest")
         payloads = {}
-        for name, checksum in expected.items():
+        for index, (name, checksum) in enumerate(expected.items(), start=1):
             pure = PurePosixPath(name)
             if pure.is_absolute() or ".." in pure.parts or "\\" in name:
                 raise ValueError(f"Unsafe bundle path: {name}")
+            report_progress(progress_callback, "validate", f"正在校验文件 {index}/{len(expected)}：{name}")
             data = archive.read(name)
             if planner.sha256_bytes(data) != checksum:
                 raise ValueError(f"Checksum failed: {name}")
@@ -284,13 +303,18 @@ def conflict_path(root: Path, relative: str, endpoint: str, digest: str, attempt
     return (root / source.parent / f"{stem}{tag}{suffix}").resolve()
 
 
-def prepare_restore(bundle_path: Path, target_root: Path) -> dict[str, Any]:
-    manifest, payloads = inspect_bundle(bundle_path)
+def prepare_restore(
+    bundle_path: Path,
+    target_root: Path,
+    progress_callback: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    manifest, payloads = inspect_bundle(bundle_path, progress_callback=progress_callback)
     target_root = target_root.expanduser().resolve()
     if target_root.exists() and not target_root.is_dir():
         raise ValueError(f"Target root is not a directory: {target_root}")
     operations = []
-    for file in manifest["files"]:
+    for index, file in enumerate(manifest["files"], start=1):
+        report_progress(progress_callback, "compare", f"正在比较文件 {index}/{len(manifest['files'])}：{file['path']}")
         relative = file["path"]
         target = (target_root / PurePosixPath(relative)).resolve()
         if not target.is_relative_to(target_root):
@@ -337,8 +361,10 @@ def restore_bundle(
     target_root: Path,
     require_empty_lock: bool = True,
     backup_parent: Path | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    prepared = prepare_restore(bundle_path, target_root)
+    report_progress(progress_callback, "preflight", "正在检查文件迁移包和目标目录...")
+    prepared = prepare_restore(bundle_path, target_root, progress_callback=progress_callback)
     manifest = prepared["manifest"]
     payloads = prepared["payloads"]
     target_root = prepared["target_root"]
@@ -352,7 +378,8 @@ def restore_bundle(
     operations = prepared["operations"]
     try:
         backup_root.mkdir(parents=True, exist_ok=False)
-        for operation in operations:
+        report_progress(progress_callback, "backup", "正在创建目标目录备份...")
+        for index, operation in enumerate(operations, start=1):
             if operation["action"] == "skip_identical":
                 continue
             target = Path(operation["target_path"])
@@ -365,10 +392,12 @@ def restore_bundle(
             else:
                 created.append(target)
             target.parent.mkdir(parents=True, exist_ok=True)
+            report_progress(progress_callback, "write", f"正在写入文件 {index}/{len(operations)}：{operation['path']}")
             temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
             temporary.write_bytes(data)
             os.replace(temporary, target)
         (backup_root / "transaction.json").write_text(json.dumps({"status": "committed", "bundle_id": manifest["bundle_id"], "operations": operations}, indent=2), encoding="utf-8")
+        report_progress(progress_callback, "complete", "文件导入完成。")
         return {"bundle_id": manifest["bundle_id"], "backup_path": str(backup_root), "operations": operations}
     except Exception:
         for target in created:

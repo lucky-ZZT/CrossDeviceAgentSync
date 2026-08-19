@@ -121,6 +121,29 @@ class MigrationBundleTests(unittest.TestCase):
         self.assertFalse(missing_target.exists())
         self.assertEqual(prepared["operations"][0]["action"], "import")
 
+    def test_export_and_restore_report_progress(self):
+        task_id = str(uuid.uuid4())
+        self.write_session(self.left, task_id, "left result")
+        left_inventory = planner.inventory(self.left, "left")
+        right_inventory = planner.inventory(self.right, "right")
+        plan = planner.compare_inventories(left_inventory, right_inventory, "left-to-right", set(), set())
+        left_path = self.root / "left-progress.json"
+        plan_path = self.root / "plan-progress.json"
+        planner.write_json(left_path, left_inventory)
+        planner.write_json(plan_path, plan)
+        events = []
+        bundle = self.root / "progress.zip"
+        migration_bundle.create_bundle(
+            left_path, plan_path, "left", bundle,
+            progress_callback=lambda stage, detail: events.append((stage, detail)),
+        )
+        migration_bundle.restore_bundle(
+            bundle, self.right, require_codex_closed=False,
+            progress_callback=lambda stage, detail: events.append((stage, detail)),
+        )
+        stages = {stage for stage, _detail in events}
+        self.assertTrue({"scan", "package", "validate", "backup", "write", "verify"}.issubset(stages))
+
     def test_committed_backup_can_restore_and_restore_can_be_undone(self):
         task_id = str(uuid.uuid4())
         self.write_session(self.left, task_id, "left result")
