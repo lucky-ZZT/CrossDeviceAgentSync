@@ -13,7 +13,7 @@ import sys
 import uuid
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 SCHEMA_VERSION = 1
@@ -144,7 +144,11 @@ def parse_session(path: Path, codex_home: Path) -> dict[str, Any]:
     }
 
 
-def inventory(codex_home: Path, device_id: str) -> dict[str, Any]:
+def inventory(
+    codex_home: Path,
+    device_id: str,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
     codex_home = codex_home.expanduser().resolve()
     if not codex_home.is_dir():
         raise ValueError(f"Codex home does not exist: {codex_home}")
@@ -153,7 +157,25 @@ def inventory(codex_home: Path, device_id: str) -> dict[str, Any]:
         root = codex_home / directory
         if root.is_dir():
             paths.extend(path for path in root.rglob("*.jsonl") if path.is_file())
-    conversations = [parse_session(path, codex_home) for path in sorted(paths)]
+    paths = sorted(paths)
+    total_bytes = sum(path.stat().st_size for path in paths)
+    completed_bytes = 0
+    conversations = []
+    for index, path in enumerate(paths, start=1):
+        size = path.stat().st_size
+        if progress_callback:
+            progress_callback(
+                "scan",
+                f"正在分析对话 {index}/{len(paths)}：{path.name}（{size / (1024 * 1024):.1f} MB）",
+            )
+        conversations.append(parse_session(path, codex_home))
+        completed_bytes += size
+        if progress_callback:
+            progress_callback(
+                "scan",
+                f"已分析 {index}/{len(paths)} 个对话，{completed_bytes / (1024 * 1024):.1f}/"
+                f"{total_bytes / (1024 * 1024):.1f} MB",
+            )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "kind": "cross-device-agent-sync-inventory",
