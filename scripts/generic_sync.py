@@ -88,12 +88,18 @@ def included(relative: str, patterns: list[str]) -> bool:
     )
 
 
-def snapshot(root: Path, endpoint_id: str, include: str | list[str] | None = None, exclude: str | list[str] | None = None) -> dict[str, Any]:
+def snapshot(
+    root: Path,
+    endpoint_id: str,
+    include: str | list[str] | None = None,
+    exclude: str | list[str] | None = None,
+    base_excludes: tuple[str, ...] = DEFAULT_EXCLUDES,
+) -> dict[str, Any]:
     root = root.expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"Endpoint root does not exist: {root}")
     include_patterns = split_patterns(include)
-    exclude_patterns = list(DEFAULT_EXCLUDES) + split_patterns(exclude or [])
+    exclude_patterns = list(base_excludes) + split_patterns(exclude or [])
     items = []
     skipped = []
     for path in sorted(root.rglob("*")):
@@ -185,7 +191,13 @@ def compare(left: dict[str, Any], right: dict[str, Any], direction: str, selecte
     }
 
 
-def create_bundle(snapshot_path: Path, plan_path: Path, side: str, output_path: Path) -> dict[str, Any]:
+def create_bundle(
+    snapshot_path: Path,
+    plan_path: Path,
+    side: str,
+    output_path: Path,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     source = load_snapshot(snapshot_path)
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     if plan.get("kind") != f"{KIND}-plan":
@@ -217,6 +229,7 @@ def create_bundle(snapshot_path: Path, plan_path: Path, side: str, output_path: 
             "path": item["path"],
             "payload": payload,
             "content_hash": item["content_hash"],
+            "size_bytes": item["size_bytes"],
             "classification": entry["classification"],
         })
     manifest = {
@@ -228,6 +241,7 @@ def create_bundle(snapshot_path: Path, plan_path: Path, side: str, output_path: 
         "source_snapshot_hash": source["snapshot_hash"],
         "plan_id": plan["plan_id"],
         "files": files,
+        "metadata": metadata or {},
         "payload_checksums": {name: planner.sha256_bytes(data) for name, data in payloads.items()},
     }
     output_path = output_path.resolve()
@@ -318,7 +332,12 @@ def prepare_restore(bundle_path: Path, target_root: Path) -> dict[str, Any]:
     }
 
 
-def restore_bundle(bundle_path: Path, target_root: Path, require_empty_lock: bool = True) -> dict[str, Any]:
+def restore_bundle(
+    bundle_path: Path,
+    target_root: Path,
+    require_empty_lock: bool = True,
+    backup_parent: Path | None = None,
+) -> dict[str, Any]:
     prepared = prepare_restore(bundle_path, target_root)
     manifest = prepared["manifest"]
     payloads = prepared["payloads"]
@@ -326,7 +345,8 @@ def restore_bundle(bundle_path: Path, target_root: Path, require_empty_lock: boo
     target_root.mkdir(parents=True, exist_ok=True)
     lock = target_root / ".cross-device-agent-sync.lock"
     descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY) if require_empty_lock else None
-    backup_root = target_root / ".cross-device-agent-sync-backups" / (dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + manifest["bundle_id"][:8])
+    backup_base = (backup_parent or target_root).expanduser().resolve()
+    backup_root = backup_base / ".cross-device-agent-sync-backups" / (dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + manifest["bundle_id"][:8])
     created = []
     backups = []
     operations = prepared["operations"]

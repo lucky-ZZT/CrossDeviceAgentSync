@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -17,7 +18,7 @@ import session_merge_planner as planner
 
 
 APP_NAME = "Cross-Device Agent Sync"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 
 def default_codex_home() -> str:
@@ -35,7 +36,10 @@ class AdvancedApp(tk.Tk):
         self.current_plan: dict | None = None
         self.selected_ids: set[str] = set()
         self.status = tk.StringVar(value="就绪")
+        self._ui_events = queue.Queue()
+        self._closing = False
         self.protocol("WM_DELETE_WINDOW", self._return_to_simple)
+        self._ui_event_after = self.after(50, self._drain_ui_events)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -56,11 +60,31 @@ class AdvancedApp(tk.Tk):
         ttk.Label(self, textvariable=self.status, anchor="w").pack(fill="x", padx=14, pady=8)
 
     def _return_to_simple(self) -> None:
+        self._closing = True
+        if self._ui_event_after:
+            self.after_cancel(self._ui_event_after)
+            self._ui_event_after = None
         callback = self.on_back
         self.on_back = None
         self.destroy()
         if callback:
             callback()
+
+    def _post_ui_event(self, callback) -> None:
+        self._ui_events.put(callback)
+
+    def _drain_ui_events(self) -> None:
+        for _ in range(100):
+            try:
+                callback = self._ui_events.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception as error:
+                self._fail(error)
+        if not self._closing:
+            self._ui_event_after = self.after(50, self._drain_ui_events)
 
     def _build_generic_compare_tab(self, notebook) -> None:
         frame = ttk.Frame(notebook, padding=14)
@@ -267,9 +291,9 @@ class AdvancedApp(tk.Tk):
         def worker():
             try:
                 result = operation()
-                self.after(0, lambda: self._finish(result, on_success))
+                self._post_ui_event(lambda result=result, on_success=on_success: self._finish(result, on_success))
             except Exception as error:
-                self.after(0, lambda: self._fail(error))
+                self._post_ui_event(lambda error=error: self._fail(error))
         threading.Thread(target=worker, daemon=True).start()
 
     def _finish(self, result, callback):

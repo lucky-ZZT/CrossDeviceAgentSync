@@ -38,6 +38,7 @@ class LocalProviderSyncTests(unittest.TestCase):
             "create table threads (id text primary key, rollout_path text not null, created_at integer not null, updated_at integer not null, "
             "source text not null, model_provider text not null, cwd text not null, title text not null, sandbox_policy text not null, "
             "approval_mode text not null, tokens_used integer not null default 0, has_user_event integer not null default 0, archived integer not null default 0, "
+            "archived_at integer, "
             "cli_version text not null default '', first_user_message text not null default '', memory_mode text not null default 'enabled', "
             "preview text not null default '', recency_at integer not null default 0, recency_at_ms integer not null default 0, history_mode text not null default 'legacy', "
             "is_pinned integer not null default 0, agent_nickname text, agent_path text)"
@@ -53,12 +54,496 @@ class LocalProviderSyncTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def _add_thread(self, provider, *, archived=False, title="Extra chat"):
+        task_id = str(uuid.uuid4())
+        directory = "archived_sessions" if archived else "sessions"
+        path = self.home / directory / f"{task_id}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "type": "session_meta",
+                "payload": {
+                    "id": task_id,
+                    "thread_name": title,
+                    "model_provider": provider,
+                },
+            }) + "\n",
+            encoding="utf-8",
+        )
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        connection.execute(
+            "insert into threads (id,rollout_path,created_at,updated_at,source,model_provider,cwd,title,sandbox_policy,approval_mode,has_user_event,archived,archived_at) "
+            "values (?,?,1,1,'vscode',?,?,?,'{}','on-request',1,?,?)",
+            (task_id, str(path), provider, str(self.home), title, int(archived), 123 if archived else None),
+        )
+        connection.commit()
+        connection.close()
+        return task_id, path
+
     def test_discovers_config_rollout_and_sqlite_providers(self):
         providers = {item["id"]: item for item in local_provider_sync.discover_providers(self.home)}
         self.assertEqual(set(providers), {"openai", "custom"})
         self.assertTrue(providers["openai"]["current"])
         self.assertEqual(providers["openai"]["sqlite_count"], 1)
         self.assertTrue(providers["custom"]["configured"])
+
+    def test_sync_all_to_provider_aligns_history_without_changing_config(self):
+        original_config = (self.home / "config.toml").read_bytes()
+
+        report = local_provider_sync.sync_all_to_provider(
+            self.home,
+            "custom",
+            update_config=False,
+            require_codex_closed=False,
+            create_backup=False,
+        )
+
+        self.assertFalse(report["config_updated"])
+        self.assertEqual(report["synchronized_rollouts"], 1)
+        self.assertEqual((self.home / "config.toml").read_bytes(), original_config)
+        first_line = json.loads(self.session.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(first_line["payload"]["model_provider"], "custom")
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        provider = connection.execute(
+            "select model_provider from threads where id=?", (self.task_id,)
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(provider, "custom")
+
+    def test_switch_and_sync_updates_config_and_all_history(self):
+        report = local_provider_sync.sync_all_to_provider(
+            self.home,
+            "custom",
+            update_config=True,
+            require_codex_closed=False,
+            create_backup=True,
+        )
+
+        self.assertTrue(report["config_updated"])
+        self.assertIn('model_provider = "custom"', (self.home / "config.toml").read_text(encoding="utf-8"))
+        providers = {item["id"]: item for item in local_provider_sync.discover_providers(self.home)}
+        self.assertTrue(providers["custom"]["current"])
+        self.assertTrue(Path(report["backup_path"], "transaction.json").is_file())
+
+        migration_bundle.restore_backup(
+            Path(report["backup_path"]), self.home, require_codex_closed=False
+        )
+        self.assertIn('model_provider = "openai"', (self.home / "config.toml").read_text(encoding="utf-8"))
+
+    def test_switch_preflight_blocks_historical_only_provider(self):
+        (self.home / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+
+        report = local_provider_sync.preflight_full_provider_sync(
+            self.home,
+            "custom",
+            update_config=True,
+            create_backup=False,
+            require_codex_closed=False,
+        )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("provider_not_configured", {problem["code"] for problem in report["problems"]})
+
+    def test_provider_used_before_reassignment_remains_discoverable_from_backup(self):
+        backup = migration_bundle.backup_root_for(self.home) / "previous-operation"
+        backup.mkdir(parents=True)
+        (backup / "transaction.json").write_text(
+            json.dumps({
+                "status": "committed",
+                "operation": "provider_reassign",
+                "source_provider": "legacy-custom",
+                "target_provider": "openai",
+            }),
+            encoding="utf-8",
+        )
+
+        providers = {item["id"]: item for item in local_provider_sync.discover_providers(self.home)}
+
+        self.assertIn("legacy-custom", providers)
+        self.assertFalse(providers["legacy-custom"]["configured"])
+        self.assertIn("managed-backup", providers["legacy-custom"]["sources"])
+
+    def test_provider_workspace_hides_other_provider_and_restores_it_on_switch(self):
+        hidden = local_provider_sync.apply_provider_workspace(
+            self.home, "custom", require_codex_closed=False
+        )
+
+        self.assertEqual(hidden["archive_count"], 1)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        row = connection.execute(
+            "select model_provider,archived,rollout_path,archived_at from threads where id=?", (self.task_id,)
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row[0:2], ("openai", 1))
+        archived_path = Path(row[2])
+        self.assertIn("archived_sessions", archived_path.parts)
+        self.assertIsNotNone(row[3])
+        self.assertTrue(archived_path.is_file())
+
+        restored = local_provider_sync.apply_provider_workspace(
+            self.home, "openai", require_codex_closed=False
+        )
+
+        self.assertEqual(restored["restore_count"], 1)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        row = connection.execute(
+            "select model_provider,archived,rollout_path,archived_at from threads where id=?", (self.task_id,)
+        ).fetchone()
+        connection.close()
+        self.assertEqual(row[0:2], ("openai", 0))
+        self.assertIn("sessions", Path(row[2]).parts)
+        self.assertIsNone(row[3])
+        state = json.loads(local_provider_sync.provider_visibility_state_path(self.home).read_text(encoding="utf-8"))
+        self.assertEqual(state["managed_hidden"], [])
+
+    def test_provider_workspace_preserves_user_archived_conversation(self):
+        archived_path = self.home / "archived_sessions" / self.session.name
+        archived_path.parent.mkdir(parents=True)
+        self.session.replace(archived_path)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        connection.execute(
+            "update threads set model_provider='custom',archived=1,archived_at=123,rollout_path=? where id=?",
+            (str(archived_path), self.task_id),
+        )
+        connection.commit()
+        connection.close()
+
+        report = local_provider_sync.apply_provider_workspace(
+            self.home, "custom", require_codex_closed=False
+        )
+
+        self.assertEqual(report["restore_count"], 0)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        archived = connection.execute(
+            "select archived from threads where id=?", (self.task_id,)
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(archived, 1)
+        self.assertTrue(archived_path.is_file())
+
+    def test_provider_workspace_repairs_database_archived_rollout_left_in_sessions(self):
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        connection.execute(
+            "update threads set archived=1,archived_at=123 where id=?",
+            (self.task_id,),
+        )
+        connection.commit()
+        connection.close()
+
+        report = local_provider_sync.apply_provider_workspace(
+            self.home, "openai", require_codex_closed=False, create_backup=False
+        )
+
+        self.assertEqual(report["archive_count"], 1)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        archived, archived_at, rollout_path = connection.execute(
+            "select archived,archived_at,rollout_path from threads where id=?",
+            (self.task_id,),
+        ).fetchone()
+        connection.close()
+        self.assertEqual(archived, 1)
+        self.assertIsNotNone(archived_at)
+        self.assertIn("archived_sessions", Path(rollout_path).parts)
+        self.assertTrue(Path(rollout_path).is_file())
+
+    def test_provider_workspace_removes_stale_catalog_row_for_already_archived_other_provider(self):
+        archived_path = self.home / "archived_sessions" / self.session.name
+        archived_path.parent.mkdir(parents=True)
+        self.session.replace(archived_path)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        connection.execute(
+            "update threads set archived=1,archived_at=123,rollout_path=? where id=?",
+            (str(archived_path), self.task_id),
+        )
+        connection.commit()
+        connection.close()
+        catalog_path = self.home / "sqlite" / "codex-dev.db"
+        catalog_path.parent.mkdir(parents=True)
+        catalog = sqlite3.connect(catalog_path)
+        catalog.execute(
+            "create table local_thread_catalog (host_id text,thread_id text,display_title text,cwd text,source_detail text,missing_candidate integer)"
+        )
+        catalog.execute(
+            "create table local_thread_catalog_metadata (id integer primary key,catalog_revision integer)"
+        )
+        catalog.execute("insert into local_thread_catalog_metadata values (1,0)")
+        catalog.execute(
+            "insert into local_thread_catalog values ('local',?,?,?,?,0)",
+            (self.task_id, "stale", str(self.home), str(archived_path)),
+        )
+        catalog.commit()
+        catalog.close()
+
+        report = local_provider_sync.apply_provider_workspace(
+            self.home, "custom", require_codex_closed=False
+        )
+
+        self.assertEqual(report["archive_count"], 0)
+        self.assertEqual(report["catalog_cleanup_count"], 1)
+        catalog = sqlite3.connect(catalog_path)
+        count = catalog.execute("select count(*) from local_thread_catalog").fetchone()[0]
+        revision = catalog.execute(
+            "select catalog_revision from local_thread_catalog_metadata where id=1"
+        ).fetchone()[0]
+        catalog.close()
+        self.assertEqual(count, 0)
+        self.assertEqual(revision, 1)
+
+    def test_reassigning_from_active_provider_hides_conversation_until_target_is_active(self):
+        moved = local_provider_sync.apply_provider_workspace(
+            self.home,
+            "openai",
+            source_provider="openai",
+            target_provider="custom",
+            selected_ids={self.task_id},
+            require_codex_closed=False,
+        )
+
+        self.assertEqual(moved["reassign_count"], 1)
+        self.assertEqual(moved["archive_count"], 1)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        provider, archived = connection.execute(
+            "select model_provider,archived from threads where id=?", (self.task_id,)
+        ).fetchone()
+        connection.close()
+        self.assertEqual((provider, archived), ("custom", 1))
+
+        local_provider_sync.apply_provider_workspace(self.home, "custom", require_codex_closed=False)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        provider, archived = connection.execute(
+            "select model_provider,archived from threads where id=?", (self.task_id,)
+        ).fetchone()
+        connection.close()
+        self.assertEqual((provider, archived), ("custom", 0))
+
+    def test_auto_handoff_makes_target_sidebar_active_and_hides_source_sidebar(self):
+        source_remaining_id, _ = self._add_thread("openai", title="Source remaining")
+        target_hidden_id, _ = self._add_thread("custom", archived=True, title="Target hidden")
+        state_path = local_provider_sync.provider_visibility_state_path(self.home)
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            json.dumps({
+                "schema_version": 2,
+                "active_provider": "openai",
+                "managed_hidden": [target_hidden_id],
+                "manual_hidden": [],
+            }),
+            encoding="utf-8",
+        )
+
+        report = local_provider_sync.apply_provider_workspace(
+            self.home,
+            "openai",
+            source_provider="openai",
+            target_provider="custom",
+            selected_ids={self.task_id},
+            auto_hide_reassigned=True,
+            enforce_provider_isolation=False,
+            require_codex_closed=False,
+            create_backup=False,
+        )
+
+        self.assertEqual(report["active_provider"], "custom")
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        rows = dict(connection.execute(
+            "select id, archived from threads where id in (?,?,?)",
+            (self.task_id, source_remaining_id, target_hidden_id),
+        ).fetchall())
+        providers = dict(connection.execute(
+            "select id, model_provider from threads where id in (?,?,?)",
+            (self.task_id, source_remaining_id, target_hidden_id),
+        ).fetchall())
+        connection.close()
+        self.assertEqual(providers[self.task_id], "custom")
+        self.assertEqual(rows[self.task_id], 0)
+        self.assertEqual(rows[source_remaining_id], 1)
+        self.assertEqual(rows[target_hidden_id], 0)
+
+    def test_auto_handoff_does_not_restore_user_archived_target_thread(self):
+        target_archived_id, target_archived_path = self._add_thread(
+            "custom", archived=True, title="User archived target"
+        )
+
+        local_provider_sync.apply_provider_workspace(
+            self.home,
+            "openai",
+            source_provider="openai",
+            target_provider="custom",
+            selected_ids={self.task_id},
+            auto_hide_reassigned=True,
+            enforce_provider_isolation=False,
+            require_codex_closed=False,
+            create_backup=False,
+        )
+
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        archived = connection.execute(
+            "select archived from threads where id=?", (target_archived_id,)
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(archived, 1)
+        self.assertTrue(target_archived_path.is_file())
+
+    def test_provider_workspace_removes_orphan_catalog_rows_that_create_empty_projects(self):
+        catalog_path = self.home / "sqlite" / "codex-dev.db"
+        catalog_path.parent.mkdir(parents=True)
+        catalog = sqlite3.connect(catalog_path)
+        catalog.execute(
+            "create table local_thread_catalog (host_id text,thread_id text,display_title text,cwd text,source_detail text,missing_candidate integer)"
+        )
+        catalog.execute(
+            "create table local_thread_catalog_metadata (id integer primary key,catalog_revision integer)"
+        )
+        catalog.execute("insert into local_thread_catalog_metadata values (1,0)")
+        catalog.execute(
+            "insert into local_thread_catalog values ('local',?,?,?,?,0)",
+            (self.task_id, "visible", str(self.home), str(self.session)),
+        )
+        orphan_id = str(uuid.uuid4())
+        catalog.execute(
+            "insert into local_thread_catalog values ('local',?,?,?,?,0)",
+            (orphan_id, "empty project shell", r"C:\stale-project", r"C:\missing.jsonl"),
+        )
+        catalog.commit()
+        catalog.close()
+
+        report = local_provider_sync.apply_provider_workspace(
+            self.home, "openai", require_codex_closed=False, create_backup=False
+        )
+
+        self.assertEqual(report["catalog_cleanup_count"], 1)
+        catalog = sqlite3.connect(catalog_path)
+        ids = {row[0] for row in catalog.execute("select thread_id from local_thread_catalog")}
+        revision = catalog.execute(
+            "select catalog_revision from local_thread_catalog_metadata where id=1"
+        ).fetchone()[0]
+        catalog.close()
+        self.assertEqual(ids, {self.task_id})
+        self.assertEqual(revision, 1)
+
+    def test_provider_workspace_without_backup_keeps_no_persistent_backup(self):
+        report = local_provider_sync.apply_provider_workspace(
+            self.home,
+            "custom",
+            require_codex_closed=False,
+            create_backup=False,
+        )
+
+        self.assertFalse(report["backup_created"])
+        self.assertIsNone(report["backup_path"])
+        self.assertFalse(migration_bundle.backup_root_for(self.home).exists())
+
+    def test_provider_workspace_without_backup_rolls_back_a_failed_move(self):
+        original = self.session.read_bytes()
+        original_atomic_write = local_provider_sync.migration_bundle.atomic_write
+
+        def fail_state_write(path, payload):
+            if Path(path) == local_provider_sync.provider_visibility_state_path(self.home):
+                raise RuntimeError("injected visibility state failure")
+            return original_atomic_write(path, payload)
+
+        with mock.patch.object(
+            local_provider_sync.migration_bundle,
+            "atomic_write",
+            side_effect=fail_state_write,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected visibility state failure"):
+                local_provider_sync.apply_provider_workspace(
+                    self.home,
+                    "custom",
+                    require_codex_closed=False,
+                    create_backup=False,
+                )
+
+        self.assertTrue(self.session.is_file())
+        self.assertEqual(self.session.read_bytes(), original)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        archived, rollout_path = connection.execute(
+            "select archived,rollout_path from threads where id=?", (self.task_id,)
+        ).fetchone()
+        connection.close()
+        self.assertEqual(archived, 0)
+        self.assertEqual(Path(rollout_path), self.session)
+
+    def test_selected_visibility_tracks_manual_hidden_state_and_can_be_restored(self):
+        hidden = local_provider_sync.apply_provider_workspace(
+            self.home,
+            "openai",
+            selected_ids={self.task_id},
+            visibility_overrides={self.task_id: False},
+            enforce_provider_isolation=False,
+            require_codex_closed=False,
+            create_backup=False,
+        )
+        self.assertEqual(hidden["archive_count"], 1)
+        state = json.loads(local_provider_sync.provider_visibility_state_path(self.home).read_text(encoding="utf-8"))
+        self.assertEqual(state["manual_hidden"], [self.task_id])
+
+        local_provider_sync.apply_provider_workspace(
+            self.home, "openai", require_codex_closed=False, create_backup=False
+        )
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        self.assertEqual(
+            connection.execute("select archived from threads where id=?", (self.task_id,)).fetchone()[0],
+            1,
+        )
+        connection.close()
+
+        local_provider_sync.apply_provider_workspace(
+            self.home,
+            "openai",
+            selected_ids={self.task_id},
+            visibility_overrides={self.task_id: True},
+            enforce_provider_isolation=False,
+            require_codex_closed=False,
+            create_backup=False,
+        )
+        state = json.loads(local_provider_sync.provider_visibility_state_path(self.home).read_text(encoding="utf-8"))
+        self.assertEqual(state["manual_hidden"], [])
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        self.assertEqual(
+            connection.execute("select archived from threads where id=?", (self.task_id,)).fetchone()[0],
+            0,
+        )
+        connection.close()
+
+    def test_selected_visibility_cannot_show_a_different_provider(self):
+        report = local_provider_sync.plan_provider_workspace(
+            self.home,
+            "custom",
+            selected_ids={self.task_id},
+            visibility_overrides={self.task_id: True},
+            enforce_provider_isolation=False,
+            create_backup=False,
+        )
+        self.assertFalse(report["ok"])
+        self.assertIn("visibility_provider_mismatch", {item["code"] for item in report["problems"]})
+
+    def test_failed_switch_sync_restores_config_rollout_and_database(self):
+        original_config = (self.home / "config.toml").read_bytes()
+        original_rollout = self.session.read_bytes()
+        with mock.patch.object(
+            local_provider_sync,
+            "_update_all_sqlite_providers",
+            side_effect=RuntimeError("injected full sync failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "injected full sync failure"):
+                local_provider_sync.sync_all_to_provider(
+                    self.home,
+                    "custom",
+                    update_config=True,
+                    require_codex_closed=False,
+                    create_backup=False,
+                )
+
+        self.assertEqual((self.home / "config.toml").read_bytes(), original_config)
+        self.assertEqual(self.session.read_bytes(), original_rollout)
+        connection = sqlite3.connect(self.home / "state_5.sqlite")
+        provider = connection.execute(
+            "select model_provider from threads where id=?", (self.task_id,)
+        ).fetchone()[0]
+        connection.close()
+        self.assertEqual(provider, "openai")
 
     def test_windows_codex_process_detection_is_case_insensitive(self):
         completed = mock.Mock(stdout='"codex.exe","11444","Console","1","100 K"\n')

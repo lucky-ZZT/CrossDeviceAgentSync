@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import uuid
 import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import session_merge_planner as planner
@@ -676,6 +676,372 @@ def restore_backup(backup_path: Path, codex_home: Path, require_codex_closed: bo
         for target in guard_created:
             if target.is_file():
                 target.unlink()
+        raise
+    finally:
+        os.close(descriptor)
+        lock_path.unlink(missing_ok=True)
+
+
+def _backup_transaction(backup_path: Path, codex_home: Path) -> tuple[Path, dict[str, Any]]:
+    selected = backup_path.expanduser().resolve()
+    root = backup_root_for(codex_home)
+    if not selected.is_relative_to(root) or selected.parent != root:
+        raise ValueError("The selected backup is not inside this Codex backup directory")
+    transaction = load_json(selected / "transaction.json")
+    if transaction.get("schema_version") != BACKUP_SCHEMA_VERSION or transaction.get("status") != "committed":
+        raise ValueError("Only a completed version-2 backup can be used for selective conversation restore")
+    if transaction.get("operation") != "conversation_delete":
+        raise ValueError("Selective conversation restore currently supports conversation-delete backups only")
+    return selected, transaction
+
+
+def _backup_entry(transaction: dict[str, Any], target: str) -> dict[str, Any] | None:
+    for entry in transaction.get("backed_up", []):
+        if isinstance(entry, dict) and entry.get("target") == target:
+            return entry
+    return None
+
+
+def _backup_source(selected: Path, entry: dict[str, Any]) -> Path:
+    source = (selected / _safe_relative(str(entry.get("backup", "")))).resolve()
+    if not source.is_relative_to(selected) or not source.is_file():
+        raise ValueError(f"A backup file is missing or unsafe: {entry.get('backup')}")
+    expected = entry.get("sha256")
+    if expected and planner.sha256_bytes(source.read_bytes()) != expected:
+        raise ValueError(f"Backup checksum failed: {entry.get('backup')}")
+    return source
+
+
+def _backup_thread_snapshot(selected: Path, transaction: dict[str, Any], task_id: str) -> tuple[dict[str, Any], Path, dict[str, Any] | None]:
+    state_entry = next(
+        (
+            entry
+            for entry in transaction.get("backed_up", [])
+            if isinstance(entry, dict) and PurePosixPath(str(entry.get("target", ""))).name.startswith("state_")
+        ),
+        None,
+    )
+    if state_entry is None:
+        raise ValueError("The backup does not contain a state database")
+    state_source = _backup_source(selected, state_entry)
+    connection = sqlite3.connect(f"file:{state_source.as_posix()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        row = connection.execute("select * from threads where id=?", (task_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"The selected backup does not contain conversation: {task_id}")
+        snapshot = {key: encode_db_value(row[key]) for key in row.keys()}
+    finally:
+        connection.close()
+    rollout_name = PureWindowsPath(normalize_windows_path(str(snapshot.get("rollout_path", "")))).name
+    rollout_entry = next(
+        (
+            entry
+            for entry in transaction.get("backed_up", [])
+            if isinstance(entry, dict)
+            and PurePosixPath(str(entry.get("target", ""))).name == rollout_name
+        ),
+        None,
+    )
+    if rollout_entry is None:
+        rollout_entry = next(
+            (
+                entry
+                for entry in transaction.get("backed_up", [])
+                if isinstance(entry, dict) and task_id in PurePosixPath(str(entry.get("target", ""))).name
+            ),
+            None,
+        )
+    if rollout_entry is None:
+        raise ValueError(f"The selected backup does not contain rollout file: {task_id}")
+    catalog_entry = _backup_entry(transaction, "sqlite/codex-dev.db")
+    return snapshot, rollout_entry, catalog_entry
+
+
+def backup_conversation_records(backup_path: Path, codex_home: Path) -> list[dict[str, Any]]:
+    """List individual conversations available inside a conversation-delete backup."""
+    selected, transaction = _backup_transaction(backup_path, codex_home.expanduser().resolve())
+    records: list[dict[str, Any]] = []
+    state_entry = next(
+        (
+            entry
+            for entry in transaction.get("backed_up", [])
+            if isinstance(entry, dict) and PurePosixPath(str(entry.get("target", ""))).name.startswith("state_")
+        ),
+        None,
+    )
+    if state_entry is None:
+        return records
+    state_source = _backup_source(selected, state_entry)
+    catalog_source = None
+    catalog_entry = _backup_entry(transaction, "sqlite/codex-dev.db")
+    if catalog_entry:
+        catalog_source = _backup_source(selected, catalog_entry)
+    state_connection = sqlite3.connect(f"file:{state_source.as_posix()}?mode=ro", uri=True)
+    state_connection.row_factory = sqlite3.Row
+    catalog_connection = (
+        sqlite3.connect(f"file:{catalog_source.as_posix()}?mode=ro", uri=True)
+        if catalog_source
+        else None
+    )
+    if catalog_connection:
+        catalog_connection.row_factory = sqlite3.Row
+        catalog_columns = {row[1] for row in catalog_connection.execute("pragma table_info(local_thread_catalog)")}
+        catalog_select = [column for column in ("display_title", "cwd", "model_provider") if column in catalog_columns]
+        catalog_query = (
+            "select " + ",".join(catalog_select) + " from local_thread_catalog "
+            "where host_id='local' and thread_id=?"
+            if catalog_select
+            else None
+        )
+    else:
+        catalog_columns = set()
+        catalog_query = None
+    try:
+        for task_id in transaction.get("task_ids", []):
+            row = state_connection.execute("select * from threads where id=?", (task_id,)).fetchone()
+            if row is None:
+                continue
+            catalog = catalog_connection.execute(catalog_query, (task_id,)).fetchone() if catalog_connection and catalog_query else None
+            catalog_values = dict(catalog) if catalog else {}
+            title = catalog_values.get("display_title") or row["title"]
+            rollout_name = PureWindowsPath(normalize_windows_path(str(row["rollout_path"] or ""))).name
+            rollout_entry = next(
+                (
+                    entry
+                    for entry in transaction.get("backed_up", [])
+                    if isinstance(entry, dict)
+                    and (
+                        PurePosixPath(str(entry.get("target", ""))).name == rollout_name
+                        or task_id in PurePosixPath(str(entry.get("target", ""))).name
+                    )
+                ),
+                None,
+            )
+            backup_rollout_path = None
+            if rollout_entry:
+                candidate = (selected / _safe_relative(str(rollout_entry.get("backup", "")))).resolve()
+                if candidate.is_relative_to(selected) and candidate.is_file():
+                    backup_rollout_path = str(candidate)
+            updated_at_ms = row["updated_at_ms"] if "updated_at_ms" in row.keys() else None
+            created_at_ms = row["created_at_ms"] if "created_at_ms" in row.keys() else None
+            records.append({
+                "task_id": task_id,
+                "title": title or task_id,
+                "cwd": catalog_values.get("cwd") or row["cwd"],
+                "model_provider": catalog_values.get("model_provider") or row["model_provider"],
+                "created_at": (created_at_ms / 1000) if created_at_ms else row["created_at"],
+                "updated_at": (updated_at_ms / 1000) if updated_at_ms else row["updated_at"],
+                "rollout_path": rollout_entry.get("target") if rollout_entry else row["rollout_path"],
+                "backup_rollout_path": backup_rollout_path,
+            })
+    finally:
+        state_connection.close()
+        if catalog_connection:
+            catalog_connection.close()
+    return records
+
+
+def _restore_catalog_entry(codex_home: Path, selected: Path, transaction: dict[str, Any], task_id: str) -> bool:
+    current = codex_home / "sqlite" / "codex-dev.db"
+    catalog_entry = _backup_entry(transaction, "sqlite/codex-dev.db")
+    if not current.is_file() or catalog_entry is None:
+        return False
+    source = _backup_source(selected, catalog_entry)
+    source_connection = sqlite3.connect(f"file:{source.as_posix()}?mode=ro", uri=True)
+    source_connection.row_factory = sqlite3.Row
+    target_connection = sqlite3.connect(current)
+    try:
+        source_row = source_connection.execute(
+            "select * from local_thread_catalog where host_id='local' and thread_id=?",
+            (task_id,),
+        ).fetchone()
+        if source_row is None:
+            return False
+        target_columns = {row[1] for row in target_connection.execute("pragma table_info(local_thread_catalog)")}
+        values = {key: source_row[key] for key in source_row.keys() if key in target_columns}
+        values["host_id"] = "local"
+        values["thread_id"] = task_id
+        if "missing_candidate" in target_columns:
+            values["missing_candidate"] = 0
+        if "observation_sequence" in target_columns:
+            sync_table = target_connection.execute(
+                "select 1 from sqlite_master where type='table' and name='local_thread_catalog_sync_state'"
+            ).fetchone()
+            if sync_table:
+                target_connection.execute(
+                    "update local_thread_catalog_sync_state set observation_sequence=observation_sequence+1 where host_id='local'"
+                )
+                sequence = target_connection.execute(
+                    "select observation_sequence from local_thread_catalog_sync_state where host_id='local'"
+                ).fetchone()
+                values["observation_sequence"] = sequence[0] if sequence else source_row["observation_sequence"]
+        columns = list(values)
+        placeholders = ",".join("?" for _ in columns)
+        updates = ",".join(f'"{column}"=excluded."{column}"' for column in columns if column not in {"host_id", "thread_id"})
+        target_connection.execute(
+            f'insert into local_thread_catalog ({",".join(f"\"{column}\"" for column in columns)}) values ({placeholders}) '
+            f"on conflict(host_id,thread_id) do update set {updates}",
+            [values[column] for column in columns],
+        )
+        _metadata = target_connection.execute(
+            "select 1 from sqlite_master where type='table' and name='local_thread_catalog_metadata'"
+        ).fetchone()
+        if _metadata:
+            target_connection.execute("update local_thread_catalog_metadata set catalog_revision=catalog_revision+1 where id=1")
+        target_connection.commit()
+        return True
+    except Exception:
+        target_connection.rollback()
+        raise
+    finally:
+        source_connection.close()
+        target_connection.close()
+
+
+def _backup_selected_paths(codex_home: Path, paths: list[Path], operation: str) -> tuple[Path, list[tuple[Path, Path]]]:
+    backup_root = backup_root_for(codex_home) / f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')}-{operation}"
+    backup_root.mkdir(parents=True, exist_ok=False)
+    backed_up: list[tuple[Path, Path]] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        relative = path.relative_to(codex_home)
+        destination = backup_root / "files" / relative
+        if path.suffix == ".sqlite":
+            backup_database(path, destination)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, destination)
+        backed_up.append((path, destination))
+    return backup_root, backed_up
+
+
+def restore_conversation_from_backup(
+    backup_path: Path,
+    codex_home: Path,
+    task_id: str,
+    require_codex_closed: bool = True,
+) -> dict[str, Any]:
+    """Restore one deleted conversation without rolling back the rest of Codex."""
+    if require_codex_closed and codex_is_running():
+        raise ValueError("Codex is running. Close Codex completely before restoring a conversation")
+    codex_home = codex_home.expanduser().resolve()
+    selected, transaction = _backup_transaction(backup_path, codex_home)
+    if task_id not in set(transaction.get("task_ids", [])):
+        raise ValueError(f"The selected backup does not contain conversation: {task_id}")
+    snapshot, rollout_entry, _ = _backup_thread_snapshot(selected, transaction, task_id)
+    database = find_state_db(codex_home)
+    if database is None:
+        raise ValueError("Codex thread database was not found")
+    if read_sqlite_threads(codex_home, {task_id}):
+        raise ValueError(f"Conversation already exists and will not be overwritten: {task_id}")
+    target_relative = Path(*PurePosixPath(str(rollout_entry["target"])).parts)
+    target = (codex_home / target_relative).resolve()
+    if not target.is_relative_to(codex_home):
+        raise ValueError("The backup rollout path is unsafe")
+    source = _backup_source(selected, rollout_entry)
+    if target.exists():
+        raise ValueError(f"The target rollout path already exists: {target}")
+    index_entry = _backup_entry(transaction, "session_index.jsonl")
+    index_source = _backup_source(selected, index_entry) if index_entry else None
+    index_rows: dict[str, dict[str, Any]] = {}
+    if index_source:
+        temporary_index = codex_home / f".restore-index-{os.getpid()}.jsonl"
+        temporary_index.write_bytes(index_source.read_bytes())
+        try:
+            index_rows = read_session_index(temporary_index.parent) if temporary_index.name == "session_index.jsonl" else {}
+        finally:
+            temporary_index.unlink(missing_ok=True)
+        if not index_rows:
+            for line in index_source.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and row_id(row) == task_id:
+                    index_rows[task_id] = row
+                    break
+    index_row = index_rows.get(task_id)
+    operation = {
+        "action": "import",
+        "source_task_id": task_id,
+        "target_task_id": task_id,
+        "target_path": str(target),
+        "title": snapshot.get("title") or task_id,
+        "sqlite_thread_row": snapshot,
+        "session_index_row": index_row,
+    }
+    catalog_database = codex_home / "sqlite" / "codex-dev.db"
+    backup_paths = [database]
+    if (codex_home / "session_index.jsonl").is_file():
+        backup_paths.append(codex_home / "session_index.jsonl")
+    if catalog_database.is_file():
+        backup_paths.append(catalog_database)
+    backup_root, backed_up = _backup_selected_paths(codex_home, backup_paths, "conversation-restore")
+    descriptor, lock_path = acquire_lock(codex_home)
+    try:
+        atomic_write(
+            backup_root / "transaction.json",
+            json.dumps(
+                _transaction_payload(
+                    status="in_progress",
+                    operation="conversation_restore",
+                    codex_home=codex_home,
+                    backup_root=backup_root,
+                    backed_up=backed_up,
+                    created_files=[target],
+                    restored_backup=str(selected),
+                    task_id=task_id,
+                ),
+                indent=2,
+                ensure_ascii=False,
+            ).encode("utf-8"),
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        merge_session_index(codex_home, [operation])
+        merge_sqlite(codex_home, [operation])
+        catalog_restored = _restore_catalog_entry(codex_home, selected, transaction, task_id)
+        verified = read_sqlite_threads(codex_home, {task_id}).get(task_id)
+        if verified is None or resolve_local_path(verified.get("rollout_path"), codex_home) != target or not target.is_file():
+            raise ValueError(f"Selective conversation restore verification failed: {task_id}")
+        if task_id not in read_session_index(codex_home):
+            raise ValueError(f"Session index restore verification failed: {task_id}")
+        atomic_write(
+            backup_root / "transaction.json",
+            json.dumps(
+                _transaction_payload(
+                    status="committed",
+                    operation="conversation_restore",
+                    codex_home=codex_home,
+                    backup_root=backup_root,
+                    backed_up=backed_up,
+                    created_files=[target],
+                    restored_backup=str(selected),
+                    task_id=task_id,
+                    catalog_restored=catalog_restored,
+                    completed_at=now_iso(),
+                ),
+                indent=2,
+                ensure_ascii=False,
+            ).encode("utf-8"),
+        )
+        return {
+            "restored_backup": str(selected),
+            "task_id": task_id,
+            "rollout_path": str(target),
+            "catalog_restored": catalog_restored,
+            "safety_backup_path": str(backup_root),
+        }
+    except Exception:
+        target.unlink(missing_ok=True)
+        for restore_target, backup in reversed(backed_up):
+            restore_target.parent.mkdir(parents=True, exist_ok=True)
+            if restore_target.suffix == ".sqlite":
+                backup_database(backup, restore_target)
+            else:
+                shutil.copy2(backup, restore_target)
         raise
     finally:
         os.close(descriptor)

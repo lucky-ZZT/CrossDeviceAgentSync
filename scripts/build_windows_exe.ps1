@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$OutputDirectory = "",
     [string]$ApplicationName = "CrossDeviceAgentSync",
     [switch]$AllowUnconfiguredRepository
@@ -18,6 +18,7 @@ if (-not $AllowUnconfiguredRepository -and $ReleaseChecker -match 'GITHUB_REPOSI
 }
 
 New-Item -ItemType Directory -Force $BuildRoot, $OutputDirectory | Out-Null
+$EntryPoint = Join-Path $PSScriptRoot "simple_sync_gui.py"
 py -m PyInstaller `
     --noconfirm `
     --clean `
@@ -28,9 +29,15 @@ py -m PyInstaller `
     --workpath (Join-Path $BuildRoot "work") `
     --specpath (Join-Path $BuildRoot "spec") `
     --paths $PSScriptRoot `
-    (Join-Path $PSScriptRoot "simple_sync_gui.py")
+    $EntryPoint;
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller 构建失败，未生成可用 EXE。"
+}
 
 $OutputPath = Join-Path $OutputDirectory "$ApplicationName.exe"
+if (-not (Test-Path -LiteralPath $OutputPath -PathType Leaf)) {
+    throw "PyInstaller 未生成预期的 EXE：$OutputPath"
+}
 $Version = if ($ApplicationName -match '^CrossDeviceAgentSync-v(?<version>\d+\.\d+\.\d+)$') {
     $Matches.version
 } else {
@@ -62,3 +69,4 @@ if (Test-Path -LiteralPath $BuildRoot) {
 }
 
 Write-Output $OutputPath
+
