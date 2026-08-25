@@ -121,6 +121,60 @@ class MigrationBundleTests(unittest.TestCase):
         self.assertFalse(missing_target.exists())
         self.assertEqual(prepared["operations"][0]["action"], "import")
 
+    def test_restore_rewrites_structured_project_paths_without_rewriting_message_text(self):
+        task_id = str(uuid.uuid4())
+        self.write_session(self.left, task_id, "left result")
+        _, bundle = self.create_plan_and_bundle(task_id)
+        target_project = self.root / "projects" / "mapped"
+        target_project.mkdir(parents=True)
+
+        migration_bundle.restore_bundle(
+            bundle,
+            self.right,
+            require_codex_closed=False,
+            path_mapping={str(self.left): str(target_project)},
+        )
+
+        row = migration_bundle.read_sqlite_threads(self.right, {task_id})[task_id]
+        self.assertEqual(row["cwd"], str(target_project))
+        inventory = planner.inventory(self.right, "right")
+        imported = next(item for item in inventory["conversations"] if item["task_id"] == task_id)
+        rollout = self.right / imported["relative_path"]
+        first = json.loads(rollout.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(first["payload"]["cwd"], str(target_project))
+
+        data = event("message", {"role": "user", "content": f"Do not alter {self.left}"}).encode()
+        rewritten = migration_bundle.rewrite_jsonl(
+            data, task_id, task_id, "", path_mapping={str(self.left): str(target_project)}
+        )
+        message = json.loads(rewritten.decode("utf-8"))
+        self.assertIn(str(self.left), message["payload"]["content"])
+
+    def test_restore_can_import_only_selected_conversations(self):
+        first_id = str(uuid.uuid4())
+        second_id = str(uuid.uuid4())
+        self.write_session(self.left, first_id, "first")
+        self.write_session(self.left, second_id, "second")
+        left_inventory = planner.inventory(self.left, "left")
+        right_inventory = planner.inventory(self.right, "right")
+        plan = planner.compare_inventories(left_inventory, right_inventory, "left-to-right", set(), set())
+        left_path, plan_path = self.root / "selected-left.json", self.root / "selected-plan.json"
+        planner.write_json(left_path, left_inventory)
+        planner.write_json(plan_path, plan)
+        bundle = self.root / "selected.zip"
+        migration_bundle.create_bundle(left_path, plan_path, "left", bundle)
+
+        report = migration_bundle.restore_bundle(
+            bundle,
+            self.right,
+            require_codex_closed=False,
+            selected_task_ids={second_id},
+        )
+
+        self.assertEqual(report["imported"], 1)
+        ids = {item["task_id"] for item in planner.inventory(self.right, "right")["conversations"]}
+        self.assertEqual(ids, {second_id})
+
     def test_export_and_restore_report_progress(self):
         task_id = str(uuid.uuid4())
         self.write_session(self.left, task_id, "left result")

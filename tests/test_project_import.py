@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 
@@ -24,6 +25,8 @@ class ProjectImportTests(unittest.TestCase):
         (self.source / "node_modules" / "large.js").write_text("skip", encoding="utf-8")
         self.bundle = self.root / "old-project.cdas.zip"
         self.projects_root = self.root / "Imported Projects"
+        self.codex_home = self.root / ".codex"
+        self.codex_home.mkdir()
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -82,6 +85,61 @@ class ProjectImportTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "not a project"):
             project_import.prepare_project_import(generic_bundle, self.projects_root)
+
+    def test_registered_import_maps_directly_on_empty_target(self):
+        project_import.create_project_bundle(self.source, self.bundle)
+
+        preview = project_import.prepare_registered_project_import(
+            self.bundle, self.projects_root, self.codex_home
+        )
+
+        self.assertEqual(preview["recommended_action"], "create_project")
+        self.assertEqual(preview["target_root"], self.projects_root.resolve() / "old-project")
+        result = project_import.restore_registered_project_bundle(
+            self.bundle,
+            preview["projects_root"],
+            self.codex_home,
+            preview["target_root"],
+            "old-project",
+            "create_project",
+            preview["registration"]["global_state_sha256"],
+            require_codex_closed=False,
+        )
+
+        state = json.loads(
+            (self.codex_home / ".codex-global-state.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            state["local-projects"][result["project_id"]]["rootPaths"],
+            [str(preview["target_root"])],
+        )
+        self.assertTrue((preview["target_root"] / "README.md").is_file())
+
+    def test_registered_import_recommends_renamed_directory_on_overlap(self):
+        project_import.create_project_bundle(self.source, self.bundle)
+        direct = self.projects_root / "old-project"
+        direct.mkdir(parents=True)
+        state = {
+            "local-projects": {
+                "existing": {
+                    "id": "existing",
+                    "name": "old-project",
+                    "rootPaths": [str(direct.resolve())],
+                },
+            },
+        }
+        (self.codex_home / ".codex-global-state.json").write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+
+        preview = project_import.prepare_registered_project_import(
+            self.bundle, self.projects_root, self.codex_home
+        )
+
+        self.assertEqual(preview["recommended_action"], "import_renamed")
+        self.assertEqual(preview["direct_conflict"]["conflict"], "same_path_existing")
+        self.assertEqual(preview["target_root"].name, "old-project-from-old-computer")
+        self.assertFalse(preview["target_root"].exists())
 
 
 if __name__ == "__main__":

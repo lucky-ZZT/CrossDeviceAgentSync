@@ -7,6 +7,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import ntpath
 import os
 import shutil
 import sqlite3
@@ -17,6 +18,7 @@ import zipfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Callable
 
+import codex_compat
 import session_merge_planner as planner
 
 
@@ -28,6 +30,16 @@ BACKUP_STREAM_BYTES = 1024 * 1024
 MAX_BACKUP_FIRST_LINE_BYTES = 8 * 1024 * 1024
 BUNDLE_STREAM_BYTES = 1024 * 1024
 BUNDLE_COMPRESSION_LEVEL = 1
+PROJECT_PATH_FIELDS = {
+    "cwd",
+    "workspace_root",
+    "project_path",
+    "project_root",
+    "repo_path",
+    "repository_path",
+    "working_directory",
+    "worktree",
+}
 
 
 ProgressCallback = Callable[[str, str], None]
@@ -320,15 +332,51 @@ def replace_strings(value: Any, source_id: str, target_id: str, title_suffix: st
     return value
 
 
-def rewrite_jsonl(data: bytes, source_id: str, target_id: str, title_suffix: str) -> bytes:
+def _mapped_project_path(value: str, path_mapping: dict[str, str]) -> str:
+    ordinary = normalize_windows_path(value)
+    comparable = ntpath.normcase(ntpath.normpath(ordinary))
+    for source, target in sorted(path_mapping.items(), key=lambda item: len(item[0]), reverse=True):
+        source_ordinary = normalize_windows_path(source).rstrip("\\/")
+        source_comparable = ntpath.normcase(ntpath.normpath(source_ordinary))
+        if comparable == source_comparable:
+            return target
+        if comparable.startswith(source_comparable + "\\"):
+            suffix = ordinary[len(source_ordinary):].lstrip("\\/")
+            return str(Path(target) / Path(*PureWindowsPath(suffix).parts)) if suffix else target
+    return value
+
+
+def rewrite_project_paths(value: Any, path_mapping: dict[str, str], parent_key: str | None = None) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: rewrite_project_paths(item, path_mapping, key)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [rewrite_project_paths(item, path_mapping, parent_key) for item in value]
+    if isinstance(value, str) and parent_key in PROJECT_PATH_FIELDS:
+        return _mapped_project_path(value, path_mapping)
+    return value
+
+
+def rewrite_jsonl(
+    data: bytes,
+    source_id: str,
+    target_id: str,
+    title_suffix: str,
+    path_mapping: dict[str, str] | None = None,
+) -> bytes:
     output = []
     for raw_line in data.splitlines():
         if not raw_line.strip():
             continue
         try:
             value = json.loads(raw_line.decode("utf-8"))
+            value = replace_strings(value, source_id, target_id, title_suffix)
+            if path_mapping:
+                value = rewrite_project_paths(value, path_mapping)
             output.append(json.dumps(
-                replace_strings(value, source_id, target_id, title_suffix),
+                value,
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8"))
@@ -357,6 +405,8 @@ def prepare_restore(
     bundle_path: Path,
     codex_home: Path,
     progress_callback: ProgressCallback | None = None,
+    selected_task_ids: set[str] | None = None,
+    path_mapping: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     manifest, payloads = inspect_bundle(bundle_path, progress_callback=progress_callback)
     codex_home = codex_home.expanduser().resolve()
@@ -371,20 +421,31 @@ def prepare_restore(
     for item in current["conversations"]:
         current_by_id.setdefault(item["task_id"], []).append(item)
 
+    selected_conversations = [
+        conversation for conversation in manifest["conversations"]
+        if selected_task_ids is None or conversation["source_task_id"] in selected_task_ids
+    ]
+    if selected_task_ids is not None:
+        available = {item["source_task_id"] for item in manifest["conversations"]}
+        unknown = selected_task_ids - available
+        if unknown:
+            raise ValueError(f"Selected conversations are not in the bundle: {', '.join(sorted(unknown))}")
     operations = []
     reserved = set(current_by_id)
-    for index, conversation in enumerate(manifest["conversations"], start=1):
+    for index, conversation in enumerate(selected_conversations, start=1):
         report_progress(
             progress_callback,
             "compare",
-            f"正在比较对话 {index}/{len(manifest['conversations'])}：{conversation['source_task_id']}",
+            f"正在比较对话 {index}/{len(selected_conversations)}：{conversation['source_task_id']}",
         )
         source_id = conversation["source_task_id"]
         target_id = conversation["target_task_id"]
         data = payloads[conversation["payload"]]
         suffix = " [migrated branch]" if target_id != source_id else ""
-        identity_copy = target_id == source_id and not suffix
-        rewritten = data if identity_copy else rewrite_jsonl(data, source_id, target_id, suffix)
+        identity_copy = target_id == source_id and not suffix and not path_mapping
+        rewritten = data if identity_copy else rewrite_jsonl(
+            data, source_id, target_id, suffix, path_mapping=path_mapping
+        )
         rewritten_hash = conversation["content_hash"] if identity_copy else planner.sha256_bytes(rewritten)
         matches = current_by_id.get(target_id, [])
         if len(matches) > 1:
@@ -400,7 +461,9 @@ def prepare_restore(
                 if candidate not in reserved:
                     target_id = candidate
                     suffix = " [migrated branch]"
-                    rewritten = rewrite_jsonl(data, source_id, target_id, suffix)
+                    rewritten = rewrite_jsonl(
+                        data, source_id, target_id, suffix, path_mapping=path_mapping
+                    )
                     rewritten_hash = planner.sha256_bytes(rewritten)
                     action = "import_as_alternate_branch"
                     break
@@ -422,6 +485,7 @@ def prepare_restore(
             "rewritten_bytes": rewritten,
             "session_index_row": conversation.get("session_index_row"),
             "sqlite_thread_row": conversation.get("sqlite_thread_row"),
+            "path_mapping": path_mapping or {},
         })
     return {"manifest": manifest, "operations": operations, "codex_home": codex_home}
 
@@ -600,6 +664,9 @@ def restore_backup(backup_path: Path, codex_home: Path, require_codex_closed: bo
     if require_codex_closed and codex_is_running():
         raise ValueError("Codex is running. Close Codex completely before restoring a backup")
     codex_home = codex_home.expanduser().resolve()
+    codex_compat.require_operation_supported(
+        codex_home, "conversation_import", "从备份恢复"
+    )
     selected = backup_path.expanduser().resolve()
     root = backup_root_for(codex_home)
     if not selected.is_relative_to(root) or selected.parent != root:
@@ -1005,6 +1072,9 @@ def restore_conversation_from_backup(
     if require_codex_closed and codex_is_running():
         raise ValueError("Codex is running. Close Codex completely before restoring a conversation")
     codex_home = codex_home.expanduser().resolve()
+    codex_compat.require_operation_supported(
+        codex_home, "conversation_import", "恢复单个对话"
+    )
     selected, transaction = _backup_transaction(backup_path, codex_home)
     if task_id not in set(transaction.get("task_ids", [])):
         raise ValueError(f"The selected backup does not contain conversation: {task_id}")
@@ -1152,6 +1222,7 @@ def merge_session_index(codex_home: Path, operations: list[dict[str, Any]]) -> N
             "updated_at": now_iso(),
         }
         row = replace_strings(row, source_id, target_id, suffix)
+        row = rewrite_project_paths(row, operation.get("path_mapping", {}))
         row["id"] = target_id
         row["rollout_path"] = operation["target_path"]
         preserved.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
@@ -1160,6 +1231,7 @@ def merge_session_index(codex_home: Path, operations: list[dict[str, Any]]) -> N
 
 def sqlite_fallback(column: str, operation: dict[str, Any], provider: str) -> Any:
     now_seconds = int(dt.datetime.now(dt.timezone.utc).timestamp())
+    mapped_project = next(iter(operation.get("path_mapping", {}).values()), None)
     defaults = {
         "id": operation["target_task_id"],
         "rollout_path": operation["target_path"],
@@ -1167,7 +1239,7 @@ def sqlite_fallback(column: str, operation: dict[str, Any], provider: str) -> An
         "updated_at": now_seconds,
         "source": "vscode",
         "model_provider": provider,
-        "cwd": str(Path(operation["target_path"]).parent),
+        "cwd": mapped_project or str(Path(operation["target_path"]).parent),
         "title": operation["title"],
         "sandbox_policy": '{"type":"read-only"}',
         "approval_mode": "on-request",
@@ -1203,6 +1275,7 @@ def merge_sqlite(codex_home: Path, operations: list[dict[str, Any]]) -> Path | N
             suffix = " [migrated branch]" if source_id != target_id else ""
             source = {key: decode_db_value(value) for key, value in (operation["sqlite_thread_row"] or {}).items()}
             source = replace_strings(source, source_id, target_id, suffix)
+            source = rewrite_project_paths(source, operation.get("path_mapping", {}))
             source["id"] = target_id
             source["rollout_path"] = operation["target_path"]
             provider = str(source.get("model_provider") or "openai")
@@ -1235,11 +1308,22 @@ def restore_bundle(
     codex_home: Path,
     require_codex_closed: bool = True,
     progress_callback: ProgressCallback | None = None,
+    selected_task_ids: set[str] | None = None,
+    path_mapping: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if require_codex_closed and codex_is_running():
         raise ValueError("Codex is running. Close Codex completely before restoring")
+    codex_compat.require_operation_supported(
+        codex_home, "conversation_import", "导入对话迁移包"
+    )
     report_progress(progress_callback, "preflight", "正在检查 Codex 状态和迁移包...")
-    prepared = prepare_restore(bundle_path, codex_home, progress_callback=progress_callback)
+    prepared = prepare_restore(
+        bundle_path,
+        codex_home,
+        progress_callback=progress_callback,
+        selected_task_ids=selected_task_ids,
+        path_mapping=path_mapping,
+    )
     operations = prepared["operations"]
     codex_home = prepared["codex_home"]
     codex_home.mkdir(parents=True, exist_ok=True)

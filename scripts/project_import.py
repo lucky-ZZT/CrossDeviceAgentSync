@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
 
 import generic_sync
+import migration_bundle
+import project_registry
 import session_merge_planner as planner
 
 
@@ -148,6 +151,50 @@ def prepare_project_import(bundle_path: Path, projects_root: Path) -> dict[str, 
     }
 
 
+def prepare_registered_project_import(
+    bundle_path: Path,
+    projects_root: Path,
+    codex_home: Path,
+) -> dict[str, Any]:
+    """Preview direct mapping and renamed fallback without writing target state."""
+    manifest = inspect_project_bundle(bundle_path)
+    root = projects_root.expanduser().resolve()
+    if root.exists() and not root.is_dir():
+        raise ValueError(f"Project import root is not a directory: {root}")
+    project_name = manifest["metadata"]["project_name"]
+    direct_target = root / project_name
+    renamed_target = next_project_destination(root, project_name)
+    direct_conflict = project_registry.inspect_project_conflicts(
+        codex_home, direct_target, project_name
+    )
+    direct_directory_exists = direct_target.exists()
+    if direct_directory_exists or direct_conflict["conflict"] != "none":
+        recommended_action = "import_renamed"
+        selected_target = renamed_target
+        selected_registration = project_registry.inspect_project_conflicts(
+            codex_home, renamed_target, renamed_target.name
+        )
+    else:
+        recommended_action = "create_project"
+        selected_target = direct_target
+        selected_registration = direct_conflict
+    prepared = generic_sync.prepare_restore(bundle_path, selected_target)
+    return {
+        "manifest": manifest,
+        "projects_root": root,
+        "direct_target": direct_target,
+        "renamed_target": renamed_target,
+        "target_root": selected_target,
+        "direct_directory_exists": direct_directory_exists,
+        "direct_conflict": direct_conflict,
+        "registration": selected_registration,
+        "recommended_action": recommended_action,
+        "operations": prepared["operations"],
+        "file_count": len(prepared["operations"]),
+        "bytes": sum(int(item.get("size_bytes", 0)) for item in manifest["files"]),
+    }
+
+
 def restore_project_bundle(bundle_path: Path, projects_root: Path, target_root: Path) -> dict[str, Any]:
     projects_root = projects_root.expanduser().resolve()
     target_root = target_root.expanduser().resolve()
@@ -161,4 +208,44 @@ def restore_project_bundle(bundle_path: Path, projects_root: Path, target_root: 
         backup_parent=projects_root,
     )
     result["project_path"] = str(target_root)
+    return result
+
+
+def restore_registered_project_bundle(
+    bundle_path: Path,
+    projects_root: Path,
+    codex_home: Path,
+    target_root: Path,
+    project_name: str,
+    registration_action: str,
+    expected_state_sha256: str | None,
+    keeper_id: str | None = None,
+    require_codex_closed: bool = True,
+) -> dict[str, Any]:
+    """Restore a new project directory and register its normal path offline."""
+    if require_codex_closed and migration_bundle.codex_is_running():
+        raise ValueError("Codex is running. Close Codex completely before importing a project")
+    if registration_action not in {"create_project"}:
+        raise ValueError("Project file import can only create a new directory registration")
+    result = restore_project_bundle(bundle_path, projects_root, target_root)
+    try:
+        registration = project_registry.register_project_offline(
+            codex_home,
+            target_root,
+            project_name,
+            registration_action,
+            keeper_id=keeper_id,
+            expected_state_sha256=expected_state_sha256,
+            require_codex_closed=False,
+        )
+    except Exception:
+        if target_root.is_dir() and target_root.parent == projects_root.expanduser().resolve():
+            shutil.rmtree(target_root)
+        raise
+    result.update({
+        "project_id": registration["project_id"],
+        "registration_backup_path": registration["backup_path"],
+        "registration_action": registration_action,
+        "registered_normal_path": registration["project_path"],
+    })
     return result

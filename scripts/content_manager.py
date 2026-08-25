@@ -7,6 +7,7 @@ import base64
 import datetime as dt
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -16,6 +17,7 @@ from collections import deque
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterator
 
+import codex_compat
 import migration_bundle
 
 
@@ -43,6 +45,22 @@ THREAD_CATALOG_REQUIRED_COLUMNS = {
     "source_detail",
     "missing_candidate",
 }
+ROLLOUT_PATH_NORMALIZE_TRIGGERS = {
+    "threads_rollout_path_normalize_after_insert",
+    "threads_rollout_path_normalize_after_update",
+}
+GLOBAL_STATE_FILE_NAME = ".codex-global-state.json"
+PROJECT_ID_SEQUENCE_FIELDS = (
+    "project-order",
+    "pinned-project-ids",
+    "electron-saved-workspace-roots",
+)
+PROJECT_ID_KEYED_FIELDS = (
+    "project-appearances",
+    "project-files",
+    "sidebar-project-thread-orders",
+    "project-writable-roots",
+)
 
 
 def _now_stamp() -> str:
@@ -418,6 +436,1667 @@ def _read_thread_rows(codex_home: Path) -> dict[str, dict[str, Any]]:
         connection.close()
 
 
+def _normalized_extended_rollout_path(value: Any) -> tuple[str | None, str | None]:
+    raw = str(value or "").strip()
+    lowered = raw.casefold()
+    if lowered.startswith("\\\\?\\unc\\"):
+        return "\\\\" + raw[8:], "extended_unc"
+    if lowered.startswith("\\\\?\\"):
+        candidate = raw[4:]
+        if re.match(r"^[A-Za-z]:\\", candidate):
+            return candidate, "extended_drive"
+        return None, "unsupported_extended"
+    return None, None
+
+
+def _normalized_project_path(value: Any) -> tuple[str | None, str | None]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None, None
+    normalized, kind = _normalized_extended_rollout_path(raw)
+    candidate = normalized if kind is not None else raw
+    if candidate is None or not ntpath.isabs(candidate):
+        return None, kind
+    try:
+        resolved = str(Path(candidate).expanduser().resolve())
+    except (OSError, RuntimeError):
+        resolved = ntpath.normpath(candidate)
+    return resolved, kind
+
+
+def _project_path_identity(value: Any) -> str | None:
+    normalized, _kind = _normalized_project_path(value)
+    return ntpath.normcase(ntpath.normpath(normalized)) if normalized else None
+
+
+def _path_belongs_to_project(value: Any, project_roots: list[str]) -> bool:
+    identity = _project_path_identity(value)
+    if identity is None:
+        return False
+    for root in project_roots:
+        root_identity = _project_path_identity(root)
+        if root_identity is None:
+            continue
+        try:
+            if ntpath.commonpath([identity, root_identity]) == root_identity:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _project_roots_identity(project: Any) -> tuple[str, ...] | None:
+    roots = project.get("rootPaths") if isinstance(project, dict) else None
+    if not isinstance(roots, list) or not roots:
+        return None
+    identities = tuple(_project_path_identity(root) for root in roots)
+    if any(identity is None for identity in identities):
+        return None
+    return identities  # type: ignore[return-value]
+
+
+def _project_reference_paths(payload: Any, project_ids: set[str]) -> dict[str, list[str]]:
+    found = {project_id: [] for project_id in project_ids}
+
+    def walk(node: Any, path: tuple[Any, ...]) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in project_ids:
+                    found[key].append(".".join(map(str, path + (key, "<key>"))))
+                walk(value, path + (key,))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, path + (index,))
+        elif isinstance(node, str) and node in project_ids:
+            found[node].append(".".join(map(str, path)))
+
+    walk(payload, ())
+    return found
+
+
+def _known_project_reference(path: str, project_id: str) -> bool:
+    parts = path.split(".")
+    if len(parts) >= 2 and parts[0] == "local-projects" and parts[1] == project_id:
+        return len(parts) == 3 and parts[2] in {"<key>", "id"}
+    if parts and parts[0] in PROJECT_ID_SEQUENCE_FIELDS:
+        return len(parts) in {1, 2}
+    if parts == ["selected-project", "projectId"]:
+        return True
+    if len(parts) == 3 and parts[0] == "thread-project-assignments" and parts[2] == "projectId":
+        return True
+    if len(parts) == 3 and parts[0] in PROJECT_ID_KEYED_FIELDS and parts[1] == project_id:
+        return parts[2] == "<key>"
+    return False
+
+
+def _project_reference_count(paths: list[str], project_id: str) -> int:
+    return sum(
+        not path.startswith(f"local-projects.{project_id}.")
+        for path in paths
+    )
+
+
+def _project_assignment_count(payload: dict[str, Any], project_id: str) -> int:
+    assignments = payload.get("thread-project-assignments")
+    if not isinstance(assignments, dict):
+        return 0
+    return sum(
+        isinstance(value, dict) and value.get("projectId") == project_id
+        for value in assignments.values()
+    )
+
+
+def _inspect_project_path_health(
+    codex_home: Path,
+    thread_rows: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Inspect extended and duplicate paths in Codex's local project registry."""
+    state_path = codex_home / GLOBAL_STATE_FILE_NAME
+    empty = {
+        "global_state": None,
+        "global_state_sha256": None,
+        "project_extended_paths": [],
+        "repairable_project_paths": [],
+        "duplicate_projects": [],
+        "blocked_duplicate_projects": [],
+        "blocked_project_paths": [],
+        "removable_projects": [],
+        "actionable_project_registrations": [],
+        "registered_projects": [],
+    }
+    if not state_path.is_file():
+        return empty
+    try:
+        raw_state = state_path.read_bytes()
+        payload = json.loads(raw_state.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        result = dict(empty)
+        result.update({
+            "global_state": str(state_path),
+            "blocked_project_paths": [{
+                "project_id": "",
+                "project_name": "",
+                "raw_path": "",
+                "normalized_path": None,
+                "repairable": False,
+                "removable": False,
+                "reason": f"Codex 全局项目状态无法读取：{error}",
+            }],
+        })
+        return result
+    projects = payload.get("local-projects")
+    if not isinstance(projects, dict):
+        projects = {}
+    rows = thread_rows if thread_rows is not None else _read_thread_rows(codex_home)
+    database_available = migration_bundle.find_state_db(codex_home) is not None
+    normalized_cwds: list[str] = []
+    for row in rows.values():
+        cwd = str(row.get("cwd") or "").strip()
+        identity = _project_path_identity(cwd)
+        if identity:
+            normalized_cwds.append(identity)
+
+    registered_projects = []
+    for project_id, project in projects.items():
+        if not isinstance(project, dict):
+            continue
+        project_name = str(project.get("name") or project_id)
+        roots = project.get("rootPaths")
+        if not isinstance(roots, list):
+            continue
+        for root_index, root in enumerate(roots):
+            raw_path = str(root or "")
+            normalized_path, path_kind = _normalized_project_path(raw_path)
+            display_path = normalized_path or raw_path
+            exists = bool(normalized_path and Path(normalized_path).is_dir())
+            if path_kind:
+                path_status = "扩展路径"
+            elif exists:
+                path_status = "普通路径"
+            else:
+                path_status = "目录不存在"
+            registered_projects.append({
+                "project_id": str(project_id),
+                "project_name": project_name,
+                "root_index": root_index,
+                "raw_path": raw_path,
+                "path": display_path,
+                "path_kind": path_kind or "ordinary",
+                "path_status": path_status,
+                "exists": exists,
+            })
+
+    all_project_ids = {str(project_id) for project_id in projects}
+    reference_paths = _project_reference_paths(payload, all_project_ids)
+    unknown_references = {
+        project_id: [
+            path for path in paths
+            if not _known_project_reference(path, project_id)
+        ]
+        for project_id, paths in reference_paths.items()
+    }
+
+    identity_groups: dict[tuple[str, ...], list[str]] = {}
+    for project_id, project in projects.items():
+        identity = _project_roots_identity(project)
+        if identity:
+            identity_groups.setdefault(identity, []).append(str(project_id))
+
+    duplicate_projects = []
+    blocked_duplicate_projects = []
+    duplicate_losers: set[str] = set()
+    duplicate_members: set[str] = set()
+    for identity, project_ids in identity_groups.items():
+        if len(project_ids) < 2:
+            continue
+
+        def keeper_key(project_id: str) -> tuple[Any, ...]:
+            project = projects[project_id]
+            roots = project.get("rootPaths", [])
+            has_extended = any(_normalized_extended_rollout_path(root)[1] for root in roots)
+            references = _project_reference_count(reference_paths.get(project_id, []), project_id)
+            created = project.get("createdAt")
+            created_value = created if isinstance(created, (int, float)) else float("inf")
+            return has_extended, -references, created_value, project_id
+
+        ordered = sorted(project_ids, key=keeper_key)
+        keeper_id, remove_ids = ordered[0], ordered[1:]
+        unknown = {
+            project_id: unknown_references.get(project_id, [])
+            for project_id in ordered
+            if unknown_references.get(project_id)
+        }
+        members = []
+        for project_id in ordered:
+            project = projects[project_id]
+            raw_roots = [str(root or "") for root in project.get("rootPaths", [])]
+            root_details = []
+            for raw_root in raw_roots:
+                normalized_root, path_kind = _normalized_project_path(raw_root)
+                root_details.append({
+                    "raw_path": raw_root,
+                    "normalized_path": normalized_root,
+                    "path_kind": path_kind or "ordinary",
+                    "exists": bool(normalized_root and Path(normalized_root).is_dir()),
+                })
+            member_identities = {
+                identity for identity in (_project_path_identity(root) for root in raw_roots)
+                if identity
+            }
+            members.append({
+                "project_id": project_id,
+                "project_name": str(project.get("name") or project_id),
+                "roots": root_details,
+                "has_extended_path": any(root["path_kind"] != "ordinary" for root in root_details),
+                "all_directories_exist": bool(root_details) and all(root["exists"] for root in root_details),
+                "known_reference_count": _project_reference_count(
+                    reference_paths.get(project_id, []), project_id
+                ),
+                "assignment_count": _project_assignment_count(payload, project_id),
+                "linked_tasks": sum(cwd in member_identities for cwd in normalized_cwds),
+                "recommended_keeper": project_id == keeper_id,
+            })
+        item = {
+            "keeper_id": keeper_id,
+            "keeper_name": str(projects[keeper_id].get("name") or keeper_id),
+            "remove_ids": remove_ids,
+            "remove_names": [str(projects[item].get("name") or item) for item in remove_ids],
+            "member_ids": ordered,
+            "member_names": [str(projects[item].get("name") or item) for item in ordered],
+            "members": members,
+            "normalized_paths": list(identity),
+            "unknown_references": unknown,
+            "reason": (
+                "存在无法识别的项目引用，禁止自动合并"
+                if unknown else "多个项目注册指向同一目录，可合并为一个项目"
+            ),
+        }
+        duplicate_members.update(ordered)
+        if unknown:
+            blocked_duplicate_projects.append(item)
+        else:
+            duplicate_projects.append(item)
+            duplicate_losers.update(remove_ids)
+
+    extended_paths = []
+    project_groups: dict[str, list[dict[str, Any]]] = {}
+    for project_id, project in projects.items():
+        if not isinstance(project, dict):
+            continue
+        roots = project.get("rootPaths")
+        if not isinstance(roots, list):
+            continue
+        project_name = str(project.get("name") or project_id)
+        for root_index, value in enumerate(roots):
+            raw = str(value or "")
+            normalized, kind = _normalized_extended_rollout_path(raw)
+            if kind is None:
+                continue
+            item = {
+                "project_id": str(project_id),
+                "project_name": project_name,
+                "root_index": root_index,
+                "raw_path": raw,
+                "normalized_path": normalized,
+                "kind": kind,
+                "repairable": False,
+                "removable": False,
+                "linked_tasks": 0,
+                "assignment_count": _project_assignment_count(payload, str(project_id)),
+                "unknown_references": unknown_references.get(str(project_id), []),
+                "reason": "",
+            }
+            if normalized is None:
+                item["reason"] = "项目扩展路径格式无法安全识别"
+            else:
+                normalized_value, _ignored = _normalized_project_path(raw)
+                item["normalized_path"] = normalized_value
+                item["linked_tasks"] = sum(
+                    cwd == _project_path_identity(normalized_value) for cwd in normalized_cwds
+                )
+                if normalized_value is None:
+                    item["reason"] = "规范化后的项目路径不是绝对路径"
+                elif project_id in duplicate_losers:
+                    keeper = next(
+                        group for group in duplicate_projects
+                        if project_id in group["remove_ids"]
+                    )
+                    item["reason"] = f"与 {keeper['keeper_name']} 指向同一目录，将合并项目记录"
+                elif any(
+                    project_id in group["remove_ids"] or project_id == group["keeper_id"]
+                    for group in blocked_duplicate_projects
+                ):
+                    item["reason"] = "同路径重复项目存在未知引用，需人工检查"
+                elif Path(normalized_value).is_dir():
+                    item["repairable"] = True
+                    item["reason"] = "项目目录存在，可安全规范化"
+                elif item["linked_tasks"]:
+                    item["reason"] = "项目目录不存在，但仍有关联对话"
+                elif not database_available:
+                    item["reason"] = "项目目录不存在，且无法确认是否有关联对话"
+                else:
+                    item["reason"] = "项目目录不存在且没有关联对话，可移除残留项目注册"
+            extended_paths.append(item)
+            project_groups.setdefault(str(project_id), []).append(item)
+
+    removable_projects = []
+    for project_id, items in project_groups.items():
+        project = projects.get(project_id, {})
+        roots = project.get("rootPaths") if isinstance(project, dict) else None
+        if (
+            isinstance(roots, list)
+            and len(items) == len(roots)
+            and items
+            and all(
+                not item["repairable"]
+                and item.get("normalized_path")
+                and item["linked_tasks"] == 0
+                and "可移除残留项目注册" in item["reason"]
+                for item in items
+            )
+        ):
+            assignment_count = _project_assignment_count(payload, project_id)
+            unknown = unknown_references.get(project_id, [])
+            removable = {
+                "project_id": project_id,
+                "project_name": str(project.get("name") or project_id),
+                "paths": [item["raw_path"] for item in items],
+                "normalized_paths": [item.get("normalized_path") for item in items],
+                "assignment_count": assignment_count,
+                "unknown_references": unknown,
+                "reason": "全部项目目录均不存在且没有关联对话",
+            }
+            if assignment_count:
+                for item in items:
+                    item["reason"] = f"项目目录不存在，但仍有 {assignment_count} 条侧栏任务归属"
+            elif unknown:
+                for item in items:
+                    item["reason"] = "项目目录不存在，但存在无法识别的项目引用"
+            else:
+                removable_projects.append(removable)
+                for item in items:
+                    item["removable"] = True
+
+    repairable_project_paths = [
+        item for item in extended_paths
+        if item["repairable"] and item["project_id"] not in duplicate_losers
+    ]
+    blocked_project_paths = [
+        item for item in extended_paths
+        if (
+            not item["repairable"]
+            and not item["removable"]
+            and item["project_id"] not in duplicate_members
+        )
+    ]
+    actionable_project_registrations = []
+    for group in duplicate_projects + blocked_duplicate_projects:
+        for member in group.get("members", []):
+            status = (
+                "扩展路径异常"
+                if member["has_extended_path"] else
+                "普通路径" if member["all_directories_exist"] else
+                "目录不存在"
+            )
+            actionable_project_registrations.append({
+                **member,
+                "issue_type": "duplicate",
+                "duplicate_group": group["keeper_id"],
+                "status": status,
+                "recommended_action": "keep" if member["recommended_keeper"] else "delete",
+                "reason": "同一目录存在重复注册",
+                "unknown_references": group.get("unknown_references", {}).get(
+                    member["project_id"], []
+                ),
+            })
+    repairable_by_id: dict[str, list[dict[str, Any]]] = {}
+    for item in repairable_project_paths:
+        repairable_by_id.setdefault(item["project_id"], []).append(item)
+    for project_id, items in repairable_by_id.items():
+        actionable_project_registrations.append({
+            "project_id": project_id,
+            "project_name": items[0]["project_name"],
+            "roots": [{
+                "raw_path": item["raw_path"],
+                "normalized_path": item["normalized_path"],
+                "path_kind": item["kind"],
+                "exists": bool(item.get("normalized_path") and Path(item["normalized_path"]).is_dir()),
+            } for item in items],
+            "has_extended_path": True,
+            "all_directories_exist": True,
+            "known_reference_count": _project_reference_count(
+                reference_paths.get(project_id, []), project_id
+            ),
+            "assignment_count": items[0].get("assignment_count", 0),
+            "linked_tasks": max(item.get("linked_tasks", 0) for item in items),
+            "issue_type": "extended",
+            "duplicate_group": None,
+            "status": "扩展路径异常",
+            "recommended_action": "normalize",
+            "reason": items[0]["reason"],
+            "unknown_references": items[0].get("unknown_references", []),
+        })
+    for item in removable_projects:
+        actionable_project_registrations.append({
+            "project_id": item["project_id"],
+            "project_name": item["project_name"],
+            "roots": [{
+                "raw_path": raw,
+                "normalized_path": normalized,
+                "path_kind": _normalized_extended_rollout_path(raw)[1] or "ordinary",
+                "exists": False,
+            } for raw, normalized in zip(item["paths"], item.get("normalized_paths", []))],
+            "has_extended_path": any(_normalized_extended_rollout_path(raw)[1] for raw in item["paths"]),
+            "all_directories_exist": False,
+            "known_reference_count": _project_reference_count(
+                reference_paths.get(item["project_id"], []), item["project_id"]
+            ),
+            "assignment_count": item.get("assignment_count", 0),
+            "linked_tasks": 0,
+            "issue_type": "stale",
+            "duplicate_group": None,
+            "status": "目录不存在",
+            "recommended_action": "delete",
+            "reason": item["reason"],
+            "unknown_references": item.get("unknown_references", []),
+        })
+
+    existing_actionable_ids = {
+        item["project_id"] for item in actionable_project_registrations
+    }
+    blocked_by_id: dict[str, list[dict[str, Any]]] = {}
+    for item in blocked_project_paths:
+        blocked_by_id.setdefault(item["project_id"], []).append(item)
+    for project_id, items in blocked_by_id.items():
+        if project_id in existing_actionable_ids:
+            continue
+        root_details = [{
+            "raw_path": item["raw_path"],
+            "normalized_path": item.get("normalized_path"),
+            "path_kind": item.get("kind") or "unsupported",
+            "exists": bool(item.get("normalized_path") and Path(item["normalized_path"]).is_dir()),
+        } for item in items]
+        actionable_project_registrations.append({
+            "project_id": project_id,
+            "project_name": items[0]["project_name"],
+            "roots": root_details,
+            "has_extended_path": any(root["path_kind"] != "ordinary" for root in root_details),
+            "all_directories_exist": bool(root_details) and all(root["exists"] for root in root_details),
+            "known_reference_count": _project_reference_count(
+                reference_paths.get(project_id, []), project_id
+            ),
+            "assignment_count": items[0].get("assignment_count", 0),
+            "linked_tasks": max(item.get("linked_tasks", 0) for item in items),
+            "issue_type": "blocked",
+            "duplicate_group": None,
+            "status": "目录不存在" if not any(root["exists"] for root in root_details) else "路径需检查",
+            "recommended_action": "keep",
+            "reason": items[0]["reason"],
+            "unknown_references": items[0].get("unknown_references", []),
+        })
+
+    duplicate_group_sizes = {
+        group["keeper_id"]: len(group.get("member_ids") or [group["keeper_id"]] + group["remove_ids"])
+        for group in duplicate_projects + blocked_duplicate_projects
+    }
+    for registration in actionable_project_registrations:
+        project_id = registration["project_id"]
+        roots = [
+            root["normalized_path"] or root["raw_path"]
+            for root in registration.get("roots", [])
+            if root.get("normalized_path") or root.get("raw_path")
+        ]
+        related_rows = [
+            row for row in rows.values()
+            if _path_belongs_to_project(row.get("cwd"), roots)
+        ]
+        related_tasks = [{
+            "task_id": str(row.get("id") or ""),
+            "title": repair_mojibake(str(row.get("title") or row.get("id") or "")),
+        } for row in related_rows]
+        registration["related_tasks"] = related_tasks
+        registration["linked_tasks"] = len(related_tasks)
+        unknown = unknown_references.get(project_id, [])
+
+        extended_roots = [
+            root for root in registration.get("roots", [])
+            if root.get("path_kind") != "ordinary"
+        ]
+        can_normalize = bool(extended_roots) and all(
+            root.get("normalized_path") and Path(root["normalized_path"]).is_dir()
+            for root in extended_roots
+        )
+        if not extended_roots:
+            normalize_reason = "当前已经是普通路径"
+        elif not can_normalize:
+            normalize_reason = "规范化后的目录不存在，需选择正确目录"
+        else:
+            normalize_reason = "已验证规范化后的目录存在"
+
+        can_delete_registration = not unknown
+        delete_reason = (
+            "存在无法识别的项目引用，不能保证删除完整"
+            if unknown else "可删除该项目 ID 及全部已知侧栏元数据"
+        )
+
+        shared_count = duplicate_group_sizes.get(registration.get("duplicate_group"), 1)
+        full_delete_reason = ""
+        can_full_delete = True
+        if not database_available:
+            can_full_delete = False
+            full_delete_reason = "无法读取线程数据库，不能完整枚举关联对话"
+        elif unknown:
+            can_full_delete = False
+            full_delete_reason = "存在无法识别的项目引用"
+        elif shared_count > 1:
+            can_full_delete = False
+            full_delete_reason = "项目目录仍被同路径的其他注册共用"
+        elif not roots or not all(Path(root).is_dir() for root in roots):
+            can_full_delete = False
+            full_delete_reason = "项目目录不存在"
+        else:
+            try:
+                for root in roots:
+                    _validate_project_path(Path(root))
+                for row in related_rows:
+                    rollout = migration_bundle.resolve_local_path(row.get("rollout_path"), codex_home)
+                    if not rollout.is_file() or not rollout.is_relative_to(codex_home):
+                        raise ValueError("关联对话文件缺失或不在当前 Codex 数据目录")
+            except (OSError, RuntimeError, ValueError) as error:
+                can_full_delete = False
+                full_delete_reason = str(error)
+        if can_full_delete:
+            full_delete_reason = "可备份并删除关联对话、注册，并把项目目录移入可恢复区"
+
+        registration["capabilities"] = {
+            "details": {"enabled": True, "reason": "可查看完整注册和关联信息"},
+            "keep": {"enabled": True, "reason": "保留当前项目注册"},
+            "normalize": {"enabled": can_normalize, "reason": normalize_reason},
+            "repoint": {"enabled": True, "reason": "选择一个实际存在且未冲突的目录后可更正"},
+            "rename": {"enabled": True, "reason": "只修改侧栏显示名称，不移动目录"},
+            "delete": {"enabled": can_delete_registration, "reason": delete_reason},
+            "full_delete": {"enabled": can_full_delete, "reason": full_delete_reason},
+        }
+
+    return {
+        "global_state": str(state_path),
+        "global_state_sha256": hashlib.sha256(raw_state).hexdigest(),
+        "project_extended_paths": extended_paths,
+        "repairable_project_paths": repairable_project_paths,
+        "duplicate_projects": duplicate_projects,
+        "blocked_duplicate_projects": blocked_duplicate_projects,
+        "blocked_project_paths": blocked_project_paths,
+        "removable_projects": removable_projects,
+        "actionable_project_registrations": actionable_project_registrations,
+        "registered_projects": registered_projects,
+    }
+
+
+def _dedupe_values(values: list[Any]) -> list[Any]:
+    result = []
+    signatures = set()
+    for value in values:
+        try:
+            signature = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            signature = repr(value)
+        if signature not in signatures:
+            signatures.add(signature)
+            result.append(value)
+    return result
+
+
+def _rewrite_project_sequence(
+    payload: dict[str, Any],
+    field: str,
+    remap: dict[str, str],
+    removed: set[str],
+) -> None:
+    value = payload.get(field)
+    if isinstance(value, list):
+        rewritten = []
+        for item in value:
+            if isinstance(item, str):
+                item = remap.get(item, item)
+                if item in removed:
+                    continue
+            rewritten.append(item)
+        payload[field] = _dedupe_values(rewritten)
+    elif isinstance(value, str):
+        rewritten = remap.get(value, value)
+        if rewritten in removed:
+            payload.pop(field, None)
+        else:
+            payload[field] = rewritten
+
+
+def _merge_keyed_project_value(field: str, keeper: Any, duplicate: Any) -> Any:
+    if keeper is None:
+        return duplicate
+    if duplicate is None:
+        return keeper
+    if field in {"project-files", "project-writable-roots"}:
+        if isinstance(keeper, list) and isinstance(duplicate, list):
+            return _dedupe_values(keeper + duplicate)
+    if field == "sidebar-project-thread-orders":
+        if isinstance(keeper, dict) and isinstance(duplicate, dict):
+            merged = dict(duplicate)
+            merged.update(keeper)
+            keeper_threads = keeper.get("threadIds")
+            duplicate_threads = duplicate.get("threadIds")
+            if isinstance(keeper_threads, list) and isinstance(duplicate_threads, list):
+                merged["threadIds"] = _dedupe_values(keeper_threads + duplicate_threads)
+            return merged
+    return keeper
+
+
+def _rewrite_project_references(
+    payload: dict[str, Any],
+    remap: dict[str, str],
+    removed: set[str],
+) -> None:
+    for field in PROJECT_ID_SEQUENCE_FIELDS:
+        _rewrite_project_sequence(payload, field, remap, removed)
+
+    selected = payload.get("selected-project")
+    if isinstance(selected, dict):
+        project_id = selected.get("projectId")
+        if isinstance(project_id, str):
+            project_id = remap.get(project_id, project_id)
+            if project_id in removed:
+                payload.pop("selected-project", None)
+            else:
+                selected["projectId"] = project_id
+
+    assignments = payload.get("thread-project-assignments")
+    if isinstance(assignments, dict):
+        for task_id, assignment in list(assignments.items()):
+            if not isinstance(assignment, dict):
+                continue
+            project_id = assignment.get("projectId")
+            if isinstance(project_id, str) and project_id in remap:
+                assignment["projectId"] = remap[project_id]
+            elif project_id in removed:
+                assignments.pop(task_id, None)
+
+    for field in PROJECT_ID_KEYED_FIELDS:
+        values = payload.get(field)
+        if not isinstance(values, dict):
+            continue
+        for old_id, keeper_id in remap.items():
+            if old_id not in values:
+                continue
+            duplicate = values.pop(old_id)
+            values[keeper_id] = _merge_keyed_project_value(
+                field, values.get(keeper_id), duplicate
+            )
+        for project_id in removed:
+            values.pop(project_id, None)
+
+
+def _validated_project_display_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if not name:
+        raise ValueError("Project display name cannot be empty")
+    if len(name) > 120:
+        raise ValueError("Project display name cannot exceed 120 characters")
+    if any(ord(character) < 32 for character in name):
+        raise ValueError("Project display name contains control characters")
+    return name
+
+
+def _validated_project_directory(value: Any) -> str:
+    normalized, _kind = _normalized_project_path(value)
+    if normalized is None:
+        raise ValueError("Project directory must be an absolute Windows path")
+    candidate = Path(normalized).expanduser()
+    if not candidate.is_absolute() or not candidate.is_dir():
+        raise ValueError(f"Project directory does not exist: {normalized}")
+    try:
+        return str(candidate.resolve())
+    except (OSError, RuntimeError):
+        return str(candidate)
+
+
+def _apply_project_registry_repairs(
+    payload: dict[str, Any],
+    duplicate_projects: list[dict[str, Any]],
+    project_repairs: list[dict[str, Any]],
+    removable_projects: list[dict[str, Any]],
+    removed_projects: list[dict[str, Any]] | None = None,
+    renamed_projects: list[dict[str, Any]] | None = None,
+    repointed_projects: list[dict[str, Any]] | None = None,
+) -> tuple[int, int, int, int, int, int]:
+    projects = payload.get("local-projects")
+    if not isinstance(projects, dict):
+        raise ValueError("Codex local project registry changed after scanning")
+    removed_projects = removed_projects or []
+    renamed_projects = renamed_projects or []
+    repointed_projects = repointed_projects or []
+
+    remap: dict[str, str] = {}
+    duplicate_remove_ids: set[str] = set()
+    for group in duplicate_projects:
+        keeper_id = group["keeper_id"]
+        remove_ids = list(group["remove_ids"])
+        keeper = projects.get(keeper_id)
+        if not isinstance(keeper, dict):
+            raise ValueError(f"Project changed after scanning: {group['keeper_name']}")
+        for project_id in remove_ids:
+            duplicate = projects.get(project_id)
+            if not isinstance(duplicate, dict):
+                raise ValueError(f"Duplicate project changed after scanning: {project_id}")
+            if _project_roots_identity(duplicate) != _project_roots_identity(keeper):
+                raise ValueError(f"Duplicate project path changed after scanning: {project_id}")
+            remap[project_id] = keeper_id
+            duplicate_remove_ids.add(project_id)
+            created_values = [
+                value for value in (keeper.get("createdAt"), duplicate.get("createdAt"))
+                if isinstance(value, (int, float))
+            ]
+            updated_values = [
+                value for value in (keeper.get("updatedAt"), duplicate.get("updatedAt"))
+                if isinstance(value, (int, float))
+            ]
+            if created_values:
+                keeper["createdAt"] = min(created_values)
+            if updated_values:
+                keeper["updatedAt"] = max(updated_values)
+        keeper_roots = keeper.get("rootPaths")
+        if isinstance(keeper_roots, list):
+            normalized_roots = []
+            for root in keeper_roots:
+                normalized, _kind = _normalized_project_path(str(root or ""))
+                normalized_roots.append(normalized or root)
+            keeper["rootPaths"] = _dedupe_values(normalized_roots)
+
+    stale_ids = {item["project_id"] for item in removable_projects}
+    explicit_remove_ids = {item["project_id"] for item in removed_projects}
+    all_removed_ids = stale_ids | explicit_remove_ids
+    _rewrite_project_references(payload, remap, all_removed_ids)
+
+    for project_id in duplicate_remove_ids:
+        projects.pop(project_id, None)
+    for item in removable_projects:
+        project = projects.get(item["project_id"])
+        if not isinstance(project, dict) or project.get("name") != item["project_name"]:
+            raise ValueError(f"Project changed after scanning: {item['project_name']}")
+        projects.pop(item["project_id"])
+    for item in removed_projects:
+        project = projects.get(item["project_id"])
+        if not isinstance(project, dict) or project.get("name") != item["project_name"]:
+            raise ValueError(f"Project changed after scanning: {item['project_name']}")
+        projects.pop(item["project_id"])
+
+    for item in project_repairs:
+        project_id = remap.get(item["project_id"], item["project_id"])
+        project = projects.get(project_id)
+        roots = project.get("rootPaths") if isinstance(project, dict) else None
+        index = item["root_index"]
+        expected = item["raw_path"]
+        if item["project_id"] in remap:
+            continue
+        if not isinstance(roots, list) or index >= len(roots) or roots[index] != expected:
+            raise ValueError(f"Project changed after scanning: {item['project_name']}")
+        roots[index] = item["normalized_path"]
+
+    repointed = 0
+    for item in repointed_projects:
+        project_id = item["project_id"]
+        project = projects.get(project_id)
+        roots = project.get("rootPaths") if isinstance(project, dict) else None
+        if not isinstance(roots, list) or roots != item["old_paths"]:
+            raise ValueError(f"Project changed after scanning: {item['project_name']}")
+        target_path = _validated_project_directory(item["new_path"])
+        target_identity = _project_path_identity(target_path)
+        for other_id, other_project in projects.items():
+            if other_id == project_id:
+                continue
+            other_identity = _project_roots_identity(other_project)
+            if other_identity and target_identity in other_identity:
+                raise ValueError(
+                    f"Target directory is already registered by project {other_id}; merge that registration instead"
+                )
+        project["rootPaths"] = [target_path]
+        repointed += 1
+
+    renamed = 0
+    for item in renamed_projects:
+        project = projects.get(item["project_id"])
+        if not isinstance(project, dict):
+            raise ValueError(f"Project changed after scanning: {item['project_id']}")
+        expected_name = item["project_name"]
+        if str(project.get("name") or item["project_id"]) != expected_name:
+            raise ValueError(f"Project name changed after scanning: {expected_name}")
+        new_name = _validated_project_display_name(item["new_name"])
+        if new_name != expected_name:
+            project["name"] = new_name
+            renamed += 1
+
+    for project_id, project in projects.items():
+        if isinstance(project, dict):
+            project["id"] = project_id
+    return (
+        len(project_repairs),
+        len(duplicate_projects),
+        len(removable_projects),
+        len(removed_projects),
+        renamed,
+        repointed,
+    )
+
+
+def inspect_rollout_path_health(codex_home: Path) -> dict[str, Any]:
+    """Inspect Codex-owned rollout paths without changing the database."""
+    codex_home = codex_home.expanduser().resolve()
+    database = migration_bundle.find_state_db(codex_home)
+    if database is None:
+        health = {
+            "database": None,
+            "extended_paths": [],
+            "repairable_paths": [],
+            "blocked_paths": [],
+            "normalization_triggers": [],
+        }
+        health.update(_inspect_project_path_health(codex_home, {}))
+        return health
+    connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        columns = {row[1] for row in connection.execute("pragma table_info(threads)")}
+        if not {"id", "rollout_path"}.issubset(columns):
+            raise ValueError("The Codex thread database does not expose rollout paths")
+        rows = connection.execute("select id, rollout_path from threads order by id").fetchall()
+        thread_rows = {row["id"]: dict(row) for row in connection.execute("select * from threads")}
+        trigger_names = {
+            row[0]
+            for row in connection.execute("select name from sqlite_master where type='trigger'")
+            if row[0] in ROLLOUT_PATH_NORMALIZE_TRIGGERS
+        }
+    finally:
+        connection.close()
+
+    extended_paths = []
+    for row in rows:
+        raw = str(row["rollout_path"] or "")
+        normalized, kind = _normalized_extended_rollout_path(raw)
+        if kind is None:
+            continue
+        item = {
+            "task_id": row["id"],
+            "raw_path": raw,
+            "normalized_path": normalized,
+            "kind": kind,
+            "repairable": False,
+            "reason": "",
+        }
+        if normalized is None:
+            item["reason"] = "扩展路径格式无法安全识别"
+        else:
+            candidate = Path(normalized).expanduser()
+            try:
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError):
+                resolved = candidate
+            if not candidate.is_absolute():
+                item["reason"] = "规范化结果不是绝对路径"
+            elif not resolved.is_relative_to(codex_home):
+                item["reason"] = "会话文件不在当前 Codex 数据目录内"
+            elif not resolved.is_file():
+                item["reason"] = "规范化后的会话文件不存在"
+            else:
+                item["normalized_path"] = str(resolved)
+                item["repairable"] = True
+                item["reason"] = "可安全规范化"
+        extended_paths.append(item)
+    health = {
+        "database": str(database),
+        "extended_paths": extended_paths,
+        "repairable_paths": [item for item in extended_paths if item["repairable"]],
+        "blocked_paths": [item for item in extended_paths if not item["repairable"]],
+        "normalization_triggers": sorted(trigger_names),
+    }
+    health.update(_inspect_project_path_health(codex_home, thread_rows))
+    return health
+
+
+def repair_rollout_path_health(
+    codex_home: Path,
+    require_codex_closed: bool = True,
+    remove_normalization_triggers: bool = True,
+    selected_project_actions: dict[str, str] | None = None,
+    selected_project_names: dict[str, str] | None = None,
+    selected_project_paths: dict[str, str] | None = None,
+    repair_conversation_paths: bool = True,
+) -> dict[str, Any]:
+    """Back up and repair only verified extended rollout paths."""
+    if require_codex_closed and migration_bundle.codex_is_running():
+        raise ValueError("Codex is running. Close Codex completely before repairing rollout paths")
+    codex_home = codex_home.expanduser().resolve()
+    codex_compat.require_operation_supported(codex_home, "path_repair", "修复路径")
+    health = inspect_rollout_path_health(codex_home)
+    database_value = health.get("database")
+    repairs = health["repairable_paths"]
+    if not repair_conversation_paths:
+        repairs = []
+    triggers = health["normalization_triggers"] if remove_normalization_triggers else []
+    project_repairs = health.get("repairable_project_paths", [])
+    duplicate_projects = health.get("duplicate_projects", [])
+    removable_projects = health.get("removable_projects", [])
+    removed_projects: list[dict[str, Any]] = []
+    renamed_projects: list[dict[str, Any]] = []
+    repointed_projects: list[dict[str, Any]] = []
+    registration_mode = bool(
+        selected_project_actions
+        and any(key.startswith("registration:") for key in selected_project_actions)
+    )
+    if registration_mode:
+        selected_names = selected_project_names or {}
+        selected_paths = selected_project_paths or {}
+        registrations = {
+            item["project_id"]: item
+            for item in health.get("actionable_project_registrations", [])
+        }
+        requested_project_ids = {
+            key.split(":", 1)[1]
+            for key, action in selected_project_actions.items()
+            if key.startswith("registration:") and action != "keep"
+        }
+        requested_project_ids.update(
+            key.split(":", 1)[1]
+            for key in (selected_project_names or {})
+            if key.startswith("registration:")
+        )
+        requested_project_ids.update(
+            key.split(":", 1)[1]
+            for key in (selected_project_paths or {})
+            if key.startswith("registration:")
+        )
+        missing_requested_ids = requested_project_ids - set(registrations)
+        if missing_requested_ids:
+            # Ordinary registrations are intentionally absent from the path
+            # repair dialog, but deletion from Content Management still needs
+            # to validate and process their IDs.
+            global_state_value = health.get("global_state")
+            database_available = bool(health.get("database"))
+            if global_state_value:
+                state_path = Path(global_state_value)
+                try:
+                    state_payload = json.loads(state_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    state_payload = {}
+                state_projects = state_payload.get("local-projects", {})
+                if isinstance(state_projects, dict):
+                    current_thread_rows = _read_thread_rows(codex_home)
+                    reference_paths = _project_reference_paths(
+                        state_payload, {str(project_id) for project_id in state_projects}
+                    )
+                    for project_id in sorted(missing_requested_ids):
+                        project = state_projects.get(project_id)
+                        if not isinstance(project, dict):
+                            continue
+                        roots = []
+                        for root_index, raw_value in enumerate(project.get("rootPaths", [])):
+                            normalized, kind = _normalized_project_path(raw_value)
+                            roots.append({
+                                "raw_path": str(raw_value or ""),
+                                "normalized_path": normalized,
+                                "path_kind": kind or "ordinary",
+                                "exists": bool(normalized and Path(normalized).is_dir()),
+                                "root_index": root_index,
+                            })
+                        root_paths = [root["normalized_path"] or root["raw_path"] for root in roots]
+                        related_rows = [
+                            row for row in current_thread_rows.values()
+                            if _path_belongs_to_project(row.get("cwd"), root_paths)
+                        ]
+                        unknown = [
+                            path for path in reference_paths.get(project_id, [])
+                            if not _known_project_reference(path, project_id)
+                        ]
+                        identity = _project_roots_identity(project)
+                        shared_count = sum(
+                            _project_roots_identity(other) == identity
+                            for other_id, other in state_projects.items()
+                            if str(other_id) != project_id and isinstance(other, dict)
+                        ) + 1 if identity else 1
+                        full_delete_enabled = bool(
+                            database_available
+                            and roots
+                            and all(root["exists"] for root in roots)
+                            and not unknown
+                            and shared_count == 1
+                        )
+                        if full_delete_enabled:
+                            try:
+                                for root in roots:
+                                    _validate_project_path(Path(root["normalized_path"] or root["raw_path"]))
+                                for row in related_rows:
+                                    rollout = migration_bundle.resolve_local_path(
+                                        row.get("rollout_path"), codex_home
+                                    )
+                                    if not rollout.is_file() or not rollout.is_relative_to(codex_home):
+                                        full_delete_enabled = False
+                                        break
+                                    _validate_project_path(Path(row.get("cwd") or ""))
+                            except (OSError, RuntimeError, ValueError):
+                                full_delete_enabled = False
+                        registrations[project_id] = {
+                            "project_id": project_id,
+                            "project_name": str(project.get("name") or project_id),
+                            "roots": roots,
+                            "related_tasks": [{
+                                "task_id": str(row.get("id") or ""),
+                                "title": repair_mojibake(str(row.get("title") or row.get("id") or "")),
+                            } for row in related_rows],
+                            "unknown_references": unknown,
+                            "capabilities": {
+                                "delete": {
+                                    "enabled": not unknown,
+                                    "reason": "存在无法识别的项目引用" if unknown else "可删除该项目注册",
+                                },
+                                "full_delete": {
+                                    "enabled": full_delete_enabled,
+                                    "reason": (
+                                        "可备份并删除关联对话、注册，并把项目目录移入可恢复区"
+                                        if full_delete_enabled else
+                                        "项目目录、关联对话或重复注册状态无法安全确认"
+                                    ),
+                                },
+                            },
+                        }
+            missing_requested_ids = requested_project_ids - set(registrations)
+        if missing_requested_ids:
+            raise ValueError(
+                "Project registration changed after scanning: "
+                + ", ".join(sorted(missing_requested_ids))
+            )
+        for project_id in requested_project_ids:
+            action = selected_project_actions.get(f"registration:{project_id}", "keep")
+            capability_key = "rename" if project_id in {
+                key.split(":", 1)[1] for key in (selected_project_names or {})
+            } and action == "keep" else action
+            capability = registrations[project_id].get("capabilities", {}).get(capability_key)
+            if capability and not capability.get("enabled"):
+                raise ValueError(str(capability.get("reason") or "Selected operation is no longer available"))
+        actions_by_id = {
+            project_id: selected_project_actions.get(f"registration:{project_id}", "keep")
+            for project_id in registrations
+        }
+        project_repairs = []
+        duplicate_projects = []
+        removable_projects = []
+        duplicate_member_ids: set[str] = set()
+
+        def add_name_change(project_id: str) -> None:
+            row = registrations[project_id]
+            key = f"registration:{project_id}"
+            requested_name = selected_names.get(key, row["project_name"])
+            if requested_name != row["project_name"]:
+                renamed_projects.append({
+                    "project_id": project_id,
+                    "project_name": row["project_name"],
+                    "new_name": requested_name,
+                })
+
+        def add_repoint(project_id: str) -> None:
+            row = registrations[project_id]
+            key = f"registration:{project_id}"
+            if key not in selected_paths:
+                raise ValueError(f"Choose a replacement directory for project: {row['project_name']}")
+            repointed_projects.append({
+                "project_id": project_id,
+                "project_name": row["project_name"],
+                "old_paths": [root["raw_path"] for root in row.get("roots", [])],
+                "new_path": _validated_project_directory(selected_paths[key]),
+            })
+
+        original_duplicate_groups = (
+            health.get("duplicate_projects", [])
+            + health.get("blocked_duplicate_projects", [])
+        )
+        for group in original_duplicate_groups:
+            member_ids = list(group.get("member_ids") or [group["keeper_id"]] + group["remove_ids"])
+            duplicate_member_ids.update(member_ids)
+            kept_ids = [project_id for project_id in member_ids if actions_by_id.get(project_id) != "delete"]
+            deleted_ids = [project_id for project_id in member_ids if actions_by_id.get(project_id) == "delete"]
+            blocked_deleted_ids = set(deleted_ids) & set(group.get("unknown_references", {}))
+            if blocked_deleted_ids:
+                raise ValueError(
+                    "Duplicate projects have unknown references and cannot be deleted: "
+                    + ", ".join(sorted(blocked_deleted_ids))
+                )
+            if not kept_ids:
+                removed_projects.extend({
+                    "project_id": project_id,
+                    "project_name": registrations[project_id]["project_name"],
+                } for project_id in member_ids)
+                continue
+            for project_id in kept_ids:
+                action = actions_by_id.get(project_id, "keep")
+                if action == "repoint":
+                    add_repoint(project_id)
+                elif action == "normalize":
+                    for root in registrations[project_id].get("roots", []):
+                        if root.get("path_kind") != "ordinary" and root.get("normalized_path"):
+                            project_repairs.append({
+                                "project_id": project_id,
+                                "project_name": registrations[project_id]["project_name"],
+                                "root_index": registrations[project_id]["roots"].index(root),
+                                "raw_path": root["raw_path"],
+                                "normalized_path": root["normalized_path"],
+                            })
+                add_name_change(project_id)
+            if deleted_ids:
+                keeper_id = next(
+                    (project_id for project_id in kept_ids if project_id == group["keeper_id"]),
+                    kept_ids[0],
+                )
+                name_by_id = {
+                    project_id: registrations[project_id]["project_name"] for project_id in member_ids
+                }
+                duplicate_projects.append({
+                    **group,
+                    "keeper_id": keeper_id,
+                    "keeper_name": name_by_id[keeper_id],
+                    "remove_ids": deleted_ids,
+                    "remove_names": [name_by_id[project_id] for project_id in deleted_ids],
+                })
+
+        original_project_repairs = health.get("repairable_project_paths", [])
+        repairs_by_id: dict[str, list[dict[str, Any]]] = {}
+        for item in original_project_repairs:
+            repairs_by_id.setdefault(item["project_id"], []).append(item)
+        stale_by_id = {
+            item["project_id"]: item for item in health.get("removable_projects", [])
+        }
+        for project_id, row in registrations.items():
+            if project_id in duplicate_member_ids:
+                continue
+            action = actions_by_id.get(project_id, "keep")
+            if action == "delete":
+                source = stale_by_id.get(project_id)
+                if source is not None:
+                    removable_projects.append(source)
+                else:
+                    if row.get("unknown_references"):
+                        raise ValueError(f"Project has unknown references and cannot be removed: {row['project_name']}")
+                    removed_projects.append({
+                        "project_id": project_id,
+                        "project_name": row["project_name"],
+                    })
+                continue
+            if action == "normalize":
+                project_repairs.extend(repairs_by_id.get(project_id, []))
+            elif action == "repoint":
+                add_repoint(project_id)
+            add_name_change(project_id)
+    elif selected_project_actions is not None:
+        selected_names = selected_project_names or {}
+        selected_repairs = []
+        seen_project_ids: set[str] = set()
+        for item in project_repairs:
+            project_id = item["project_id"]
+            key = f"normalize:{project_id}"
+            action = selected_project_actions.get(key, "ignore")
+            if action == "normalize":
+                selected_repairs.append(item)
+            elif action == "remove" and project_id not in seen_project_ids:
+                if item.get("unknown_references"):
+                    raise ValueError(f"Project has unknown references and cannot be removed: {item['project_name']}")
+                removed_projects.append({
+                    "project_id": project_id,
+                    "project_name": item["project_name"],
+                })
+            if action != "remove" and project_id not in seen_project_ids:
+                requested_name = selected_names.get(key, item["project_name"])
+                if requested_name != item["project_name"]:
+                    renamed_projects.append({
+                        "project_id": project_id,
+                        "project_name": item["project_name"],
+                        "new_name": requested_name,
+                    })
+            seen_project_ids.add(project_id)
+        project_repairs = selected_repairs
+
+        selected_duplicates = []
+        for item in duplicate_projects:
+            key = f"duplicate:{item['keeper_id']}"
+            action = selected_project_actions.get(key, "ignore")
+            member_ids = list(item.get("member_ids") or [item["keeper_id"]] + item["remove_ids"])
+            member_names = list(item.get("member_names") or [item["keeper_name"]] + item["remove_names"])
+            name_by_id = dict(zip(member_ids, member_names))
+            if action.startswith("merge:"):
+                keeper_id = action.split(":", 1)[1]
+                if keeper_id not in member_ids:
+                    raise ValueError(f"Selected duplicate keeper is no longer valid: {keeper_id}")
+                adjusted = dict(item)
+                adjusted["keeper_id"] = keeper_id
+                adjusted["keeper_name"] = name_by_id[keeper_id]
+                adjusted["remove_ids"] = [project_id for project_id in member_ids if project_id != keeper_id]
+                adjusted["remove_names"] = [name_by_id[project_id] for project_id in adjusted["remove_ids"]]
+                selected_duplicates.append(adjusted)
+                requested_name = selected_names.get(key, adjusted["keeper_name"])
+                if requested_name != adjusted["keeper_name"]:
+                    renamed_projects.append({
+                        "project_id": keeper_id,
+                        "project_name": adjusted["keeper_name"],
+                        "new_name": requested_name,
+                    })
+            elif action == "remove":
+                if item.get("unknown_references"):
+                    raise ValueError(f"Duplicate projects have unknown references and cannot be removed: {item['keeper_name']}")
+                removed_projects.extend(
+                    {"project_id": project_id, "project_name": name_by_id[project_id]}
+                    for project_id in member_ids
+                )
+        duplicate_projects = selected_duplicates
+
+        removable_projects = [
+            item for item in removable_projects
+            if selected_project_actions.get(f"stale:{item['project_id']}") == "remove"
+        ]
+    blocked_project_count = (
+        len(health.get("blocked_project_paths", []))
+        + len(health.get("blocked_duplicate_projects", []))
+    )
+    if not any((
+        repairs,
+        triggers,
+        project_repairs,
+        duplicate_projects,
+        removable_projects,
+        removed_projects,
+        renamed_projects,
+        repointed_projects,
+    )):
+        return {
+            "backup_path": None,
+            "repaired": 0,
+            "blocked": len(health["blocked_paths"]),
+            "triggers_removed": [],
+            "project_paths_repaired": 0,
+            "duplicate_projects_merged": 0,
+            "stale_projects_removed": 0,
+            "project_registrations_removed": 0,
+            "project_names_changed": 0,
+            "project_paths_repointed": 0,
+            "project_paths_blocked": blocked_project_count,
+        }
+
+    database = Path(database_value) if database_value else None
+    global_state_value = health.get("global_state")
+    global_state = Path(global_state_value) if global_state_value else None
+    backup_paths = []
+    if database is not None and (repairs or triggers):
+        backup_paths.append(database)
+    if global_state is not None and any((
+        project_repairs,
+        duplicate_projects,
+        removable_projects,
+        removed_projects,
+        renamed_projects,
+        repointed_projects,
+    )):
+        backup_paths.append(global_state)
+    backup_root, backed_up = _backup_selected_files(codex_home, backup_paths, "path-health-repair")
+    descriptor, lock_path = migration_bundle.acquire_lock(codex_home)
+    try:
+        _write_transaction(
+            codex_home,
+            backup_root,
+            backed_up,
+            "rollout_path_repair",
+            "in_progress",
+            repairs=repairs,
+            triggers_to_remove=triggers,
+            blocked_paths=health["blocked_paths"],
+            project_repairs=project_repairs,
+            duplicate_projects=duplicate_projects,
+            removable_projects=removable_projects,
+            removed_projects=removed_projects,
+            renamed_projects=renamed_projects,
+            repointed_projects=repointed_projects,
+            blocked_project_paths=health.get("blocked_project_paths", []),
+            blocked_duplicate_projects=health.get("blocked_duplicate_projects", []),
+        )
+        if repairs or triggers:
+            if database is None:
+                raise ValueError("Codex thread database was not found")
+            connection = sqlite3.connect(database, timeout=10)
+            try:
+                connection.execute("begin immediate")
+                for item in repairs:
+                    cursor = connection.execute(
+                        "update threads set rollout_path=? where id=? and rollout_path=?",
+                        (item["normalized_path"], item["task_id"], item["raw_path"]),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError(f"Conversation changed after scanning: {item['task_id']}")
+                for trigger in triggers:
+                    if trigger not in ROLLOUT_PATH_NORMALIZE_TRIGGERS:
+                        raise ValueError(f"Refusing to remove an unknown trigger: {trigger}")
+                    connection.execute(f'DROP TRIGGER IF EXISTS "{trigger}"')
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        if any((
+            project_repairs,
+            duplicate_projects,
+            removable_projects,
+            removed_projects,
+            renamed_projects,
+            repointed_projects,
+        )):
+            if global_state is None:
+                raise ValueError("Codex global project state was not found")
+            current_state = global_state.read_bytes()
+            if hashlib.sha256(current_state).hexdigest() != health.get("global_state_sha256"):
+                raise ValueError("Codex global project state changed after scanning")
+            payload = json.loads(current_state.decode("utf-8"))
+            _apply_project_registry_repairs(
+                payload,
+                duplicate_projects,
+                project_repairs,
+                removable_projects,
+                removed_projects,
+                renamed_projects,
+                repointed_projects,
+            )
+            migration_bundle.atomic_write(
+                global_state,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+            )
+
+        verified = inspect_rollout_path_health(codex_home)
+        repaired_ids = {item["task_id"] for item in repairs}
+        remaining_ids = {item["task_id"] for item in verified["extended_paths"]}
+        if repaired_ids & remaining_ids:
+            raise ValueError("Rollout path repair verification failed")
+        if set(triggers) & set(verified["normalization_triggers"]):
+            raise ValueError("Normalization trigger removal verification failed")
+        remaining_project_raw_paths = {
+            item["raw_path"] for item in verified.get("project_extended_paths", [])
+        }
+        if {item["raw_path"] for item in project_repairs} & remaining_project_raw_paths:
+            raise ValueError("Project path repair verification failed")
+        remaining_project_ids = {
+            item["project_id"] for item in verified.get("project_extended_paths", [])
+        }
+        if {item["project_id"] for item in removable_projects} & remaining_project_ids:
+            raise ValueError("Stale project removal verification failed")
+        removed_project_ids = {
+            project_id
+            for group in duplicate_projects
+            for project_id in group["remove_ids"]
+        } | {
+            item["project_id"] for item in removable_projects + removed_projects
+        }
+        if global_state is not None and removed_project_ids:
+            verified_payload = json.loads(global_state.read_text(encoding="utf-8"))
+            remaining_references = _project_reference_paths(verified_payload, removed_project_ids)
+            if any(remaining_references.values()):
+                raise ValueError("Project reference merge verification failed")
+        merged_id_sets = {frozenset(group["remove_ids"] + [group["keeper_id"]]) for group in duplicate_projects}
+        for group in verified.get("duplicate_projects", []) + verified.get("blocked_duplicate_projects", []):
+            if frozenset(group["remove_ids"] + [group["keeper_id"]]) in merged_id_sets:
+                raise ValueError("Duplicate project merge verification failed")
+        if global_state is not None and renamed_projects:
+            verified_payload = json.loads(global_state.read_text(encoding="utf-8"))
+            verified_projects = verified_payload.get("local-projects", {})
+            for item in renamed_projects:
+                project = verified_projects.get(item["project_id"])
+                if not isinstance(project, dict) or project.get("name") != _validated_project_display_name(item["new_name"]):
+                    raise ValueError("Project display name verification failed")
+        if global_state is not None and repointed_projects:
+            verified_payload = json.loads(global_state.read_text(encoding="utf-8"))
+            verified_projects = verified_payload.get("local-projects", {})
+            for item in repointed_projects:
+                project = verified_projects.get(item["project_id"])
+                if not isinstance(project, dict) or project.get("rootPaths") != [
+                    _validated_project_directory(item["new_path"])
+                ]:
+                    raise ValueError("Project directory correction verification failed")
+        _write_transaction(
+            codex_home,
+            backup_root,
+            backed_up,
+            "rollout_path_repair",
+            "committed",
+            repairs=repairs,
+            repaired=len(repairs),
+            blocked_paths=verified["blocked_paths"],
+            triggers_removed=triggers,
+            project_repairs=project_repairs,
+            project_paths_repaired=len(project_repairs),
+            duplicate_projects=duplicate_projects,
+            duplicate_projects_merged=len(duplicate_projects),
+            stale_projects_removed=len(removable_projects),
+            removed_projects=removed_projects,
+            project_registrations_removed=len(removed_projects),
+            renamed_projects=renamed_projects,
+            project_names_changed=len(renamed_projects),
+            repointed_projects=repointed_projects,
+            project_paths_repointed=len(repointed_projects),
+            blocked_project_paths=verified.get("blocked_project_paths", []),
+            blocked_duplicate_projects=verified.get("blocked_duplicate_projects", []),
+        )
+        return {
+            "backup_path": str(backup_root),
+            "repaired": len(repairs),
+            "blocked": len(verified["blocked_paths"]),
+            "triggers_removed": triggers,
+            "project_paths_repaired": len(project_repairs),
+            "duplicate_projects_merged": len(duplicate_projects),
+            "stale_projects_removed": len(removable_projects),
+            "project_registrations_removed": len(removed_projects),
+            "project_names_changed": len(renamed_projects),
+            "project_paths_repointed": len(repointed_projects),
+            "project_paths_blocked": (
+                len(verified.get("blocked_project_paths", []))
+                + len(verified.get("blocked_duplicate_projects", []))
+            ),
+        }
+    except Exception:
+        for target, backup in reversed(backed_up):
+            if target.suffix == ".sqlite":
+                migration_bundle.backup_database(backup, target)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(backup, target)
+        raise
+    finally:
+        os.close(descriptor)
+        lock_path.unlink(missing_ok=True)
+
+
+def fully_delete_registered_project(
+    codex_home: Path,
+    project_id: str,
+    require_codex_closed: bool = True,
+) -> dict[str, Any]:
+    """Remove one safe project registration, its conversations, and its directories recoverably."""
+    if require_codex_closed and migration_bundle.codex_is_running():
+        raise ValueError("Codex is running. Close Codex completely before deleting a project")
+    codex_home = codex_home.expanduser().resolve()
+    codex_compat.require_operation_supported(
+        codex_home, "full_project_delete", "彻底删除项目"
+    )
+    health = inspect_rollout_path_health(codex_home)
+    registration = next(
+        (
+            item for item in health.get("actionable_project_registrations", [])
+            if item["project_id"] == project_id
+        ),
+        None,
+    )
+    if registration is None:
+        global_state_value = health.get("global_state")
+        database_available = bool(health.get("database"))
+        if global_state_value:
+            try:
+                state_payload = json.loads(Path(global_state_value).read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                state_payload = {}
+            project = state_payload.get("local-projects", {}).get(project_id)
+            if isinstance(project, dict):
+                current_rows = _read_thread_rows(codex_home)
+                roots = []
+                for root_index, raw_value in enumerate(project.get("rootPaths", [])):
+                    normalized, kind = _normalized_project_path(raw_value)
+                    roots.append({
+                        "raw_path": str(raw_value or ""),
+                        "normalized_path": normalized,
+                        "path_kind": kind or "ordinary",
+                        "exists": bool(normalized and Path(normalized).is_dir()),
+                        "root_index": root_index,
+                    })
+                root_paths = [root["normalized_path"] or root["raw_path"] for root in roots]
+                related_rows = [
+                    row for row in current_rows.values()
+                    if _path_belongs_to_project(row.get("cwd"), root_paths)
+                ]
+                reference_paths = _project_reference_paths(
+                    state_payload, {str(value) for value in state_payload.get("local-projects", {})}
+                )
+                unknown = [
+                    path for path in reference_paths.get(project_id, [])
+                    if not _known_project_reference(path, project_id)
+                ]
+                identity = _project_roots_identity(project)
+                shared_count = sum(
+                    _project_roots_identity(other) == identity
+                    for other_id, other in state_payload.get("local-projects", {}).items()
+                    if str(other_id) != project_id and isinstance(other, dict)
+                ) + 1 if identity else 1
+                full_delete_enabled = bool(
+                    database_available
+                    and roots
+                    and all(root["exists"] for root in roots)
+                    and not unknown
+                    and shared_count == 1
+                )
+                if full_delete_enabled:
+                    try:
+                        for root in roots:
+                            _validate_project_path(Path(root["normalized_path"] or root["raw_path"]))
+                        for row in related_rows:
+                            rollout = migration_bundle.resolve_local_path(row.get("rollout_path"), codex_home)
+                            if not rollout.is_file() or not rollout.is_relative_to(codex_home):
+                                full_delete_enabled = False
+                                break
+                    except (OSError, RuntimeError, ValueError):
+                        full_delete_enabled = False
+                registration = {
+                    "project_id": project_id,
+                    "project_name": str(project.get("name") or project_id),
+                    "roots": roots,
+                    "related_tasks": [{
+                        "task_id": str(row.get("id") or ""),
+                        "title": repair_mojibake(str(row.get("title") or row.get("id") or "")),
+                    } for row in related_rows],
+                    "capabilities": {
+                        "full_delete": {
+                            "enabled": full_delete_enabled,
+                            "reason": (
+                                "可备份并删除关联对话、注册，并把项目目录移入可恢复区"
+                                if full_delete_enabled else
+                                "项目目录、关联对话或重复注册状态无法安全确认"
+                            ),
+                        },
+                    },
+                }
+    if registration is None:
+        raise ValueError("Project registration changed after scanning; rescan before deleting")
+    capability = registration.get("capabilities", {}).get("full_delete", {})
+    if not capability.get("enabled"):
+        raise ValueError(str(capability.get("reason") or "Project cannot be deleted safely"))
+    roots = [
+        _validate_project_path(Path(root["normalized_path"] or root["raw_path"]))
+        for root in registration.get("roots", [])
+    ]
+    task_ids = {
+        str(item["task_id"]) for item in registration.get("related_tasks", [])
+        if item.get("task_id")
+    }
+    registration_backup = None
+    conversation_backup = None
+    trashed_items: list[str] = []
+    try:
+        registry_result = repair_rollout_path_health(
+            codex_home,
+            require_codex_closed=False,
+            remove_normalization_triggers=False,
+            selected_project_actions={f"registration:{project_id}": "delete"},
+            repair_conversation_paths=False,
+        )
+        registration_backup = registry_result.get("backup_path")
+        if registry_result.get("project_registrations_removed", 0) != 1:
+            raise ValueError("Project registration deletion verification failed")
+        if task_ids:
+            conversation_result = delete_conversations(
+                codex_home, task_ids, require_codex_closed=False
+            )
+            conversation_backup = conversation_result.get("backup_path")
+        trash_result = move_projects_to_trash(roots, require_codex_closed=False)
+        trashed_items = list(trash_result.get("items", []))
+        for item_value in trashed_items:
+            manifest_path = Path(item_value) / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.update({
+                "operation": "full_project_delete",
+                "codex_home": str(codex_home),
+                "project_id": project_id,
+                "registration_backup": registration_backup,
+                "conversation_backup": conversation_backup,
+                "task_ids": sorted(task_ids),
+            })
+            migration_bundle.atomic_write(
+                manifest_path,
+                (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+            )
+        verified_state = json.loads((codex_home / GLOBAL_STATE_FILE_NAME).read_text(encoding="utf-8"))
+        if project_id in verified_state.get("local-projects", {}):
+            raise ValueError("Project registration still exists after deletion")
+        if task_ids and migration_bundle.read_sqlite_threads(codex_home, task_ids):
+            raise ValueError("Project conversations still exist after deletion")
+        if any(path.exists() for path in roots):
+            raise ValueError("Project directory still exists after deletion")
+        return {
+            "project_id": project_id,
+            "deleted_conversations": len(task_ids),
+            "registration_backup": registration_backup,
+            "conversation_backup": conversation_backup,
+            "trash_items": trashed_items,
+            "trash_root": trash_result["trash_root"],
+        }
+    except Exception:
+        for item_value in reversed(trashed_items):
+            try:
+                restore_project(Path(item_value), require_codex_closed=False)
+            except Exception:
+                pass
+        if conversation_backup:
+            try:
+                migration_bundle.restore_backup(
+                    Path(conversation_backup), codex_home, require_codex_closed=False
+                )
+            except Exception:
+                pass
+        if registration_backup:
+            try:
+                migration_bundle.restore_backup(
+                    Path(registration_backup), codex_home, require_codex_closed=False
+                )
+            except Exception:
+                pass
+        raise
+
+
 def _thread_catalog_database(codex_home: Path) -> Path | None:
     database = codex_home / THREAD_CATALOG_RELATIVE_PATH
     if not database.is_file():
@@ -514,7 +2193,13 @@ def _consistency_inventory(
 
 def scan_content(codex_home: Path) -> dict[str, Any]:
     codex_home = codex_home.expanduser().resolve()
+    compatibility = codex_compat.inspect_codex_storage(codex_home)
+    native_projects = codex_compat.read_native_projects(codex_home)
+    native_projects_by_id = {
+        str(project["project_id"]): project for project in native_projects
+    }
     database_rows = _read_thread_rows(codex_home)
+    path_health = inspect_rollout_path_health(codex_home)
     _catalog_database, catalog_rows = _read_thread_catalog(codex_home)
     conversations = []
     images = []
@@ -542,7 +2227,17 @@ def scan_content(codex_home: Path) -> dict[str, Any]:
         image_bytes = sum(image["size_bytes"] * image["occurrences"] for image in image_rows)
         unique_image_bytes = sum(image["size_bytes"] for image in image_rows)
         cwd_value = str(row.get("cwd") or "").strip()
-        project_path, project_name = project_identity_from_cwd(cwd_value)
+        project_id = str(row.get("project_id") or "").strip()
+        native_project = native_projects_by_id.get(project_id)
+        if native_project:
+            native_roots = [str(value) for value in native_project.get("roots", [])]
+            project_path = str(native_project.get("primary_root") or "")
+            if not project_path:
+                project_path, _fallback_name = project_identity_from_cwd(cwd_value)
+            project_name = str(native_project.get("project_name") or project_id)
+        else:
+            native_roots = []
+            project_path, project_name = project_identity_from_cwd(cwd_value)
         provider = str(row.get("model_provider") or "openai")
         original_title = str(row.get("title") or "")
         catalog_title = str(catalog_rows.get(task_id, {}).get("display_title") or "")
@@ -587,6 +2282,12 @@ def scan_content(codex_home: Path) -> dict[str, Any]:
             "cwd": cwd_value,
             "project_path": project_path,
             "project_name": project_name,
+            "project_id": project_id,
+            "project_roots": native_roots,
+            "is_pinned": bool(row.get("is_pinned")),
+            "thread_section_id": str(row.get("thread_section_id") or ""),
+            "section_position": row.get("section_position"),
+            "history_mode": str(row.get("history_mode") or "legacy"),
             "rollout_path": str(rollout_path),
             "relative_path": relative_path,
             "updated_at": updated_at,
@@ -642,8 +2343,24 @@ def scan_content(codex_home: Path) -> dict[str, Any]:
                     "image_bytes": 0,
                     "latest_updated_at": "",
                     "exists": Path(project_path).expanduser().is_dir(),
+                    "project_id": project_id,
+                    "native_project_ids": [],
+                    "project_roots": [],
+                    "storage_sources": [],
                 },
             )
+            if project_id and native_project:
+                if project_id not in project["native_project_ids"]:
+                    project["native_project_ids"].append(project_id)
+                project["project_id"] = project_id
+                project["project_name"] = project_name
+                project["registered"] = True
+                project["storage_sources"] = list(dict.fromkeys(
+                    [*project.get("storage_sources", []), "state_db"]
+                ))
+                project["project_roots"] = list(dict.fromkeys(
+                    [*project.get("project_roots", []), *native_roots]
+                ))
             project["thread_ids"].append(task_id)
             project["thread_count"] += 1
             project["conversation_bytes"] += stat.st_size
@@ -657,10 +2374,114 @@ def scan_content(codex_home: Path) -> dict[str, Any]:
     for group in conversation_groups.values():
         for item in group:
             item["possible_duplicates"] = len(group) if len(group) > 1 else 0
+    # The sidebar project registry is authoritative for project existence, even
+    # when a registered project has no conversation rows yet. Merge it with
+    # cwd-derived projects by normalized path so empty or newly imported
+    # projects remain visible in content management.
+    registered_by_identity: dict[str, list[dict[str, Any]]] = {}
+    for registration in path_health.get("registered_projects", []):
+        path = str(registration.get("path") or "").strip()
+        identity = _project_path_identity(path)
+        if identity:
+            registered_by_identity.setdefault(identity, []).append(registration)
+
+    project_by_identity: dict[str, dict[str, Any]] = {}
+    for project in projects.values():
+        identity = _project_path_identity(project.get("path"))
+        if identity:
+            project_by_identity[identity] = project
+        project.setdefault("registered", False)
+        project.setdefault("registration_ids", [])
+        project.setdefault("registration_names", [])
+        project.setdefault("registration_statuses", [])
+        project.setdefault("native_project_ids", [])
+        project.setdefault("project_roots", [])
+        project.setdefault("storage_sources", [])
+
+    for identity, registrations in registered_by_identity.items():
+        project = project_by_identity.get(identity)
+        if project is None:
+            first = registrations[0]
+            path = str(first.get("path") or "")
+            project = {
+                "path": path,
+                "thread_ids": [],
+                "thread_count": 0,
+                "conversation_bytes": 0,
+                "image_bytes": 0,
+                "latest_updated_at": "",
+                "exists": bool(first.get("exists")),
+            }
+            projects[path] = project
+            project_by_identity[identity] = project
+        project["registered"] = True
+        project["storage_sources"] = list(dict.fromkeys(
+            [*project.get("storage_sources", []), "global_state"]
+        ))
+        project["registration_ids"] = list(dict.fromkeys(
+            [*project.get("registration_ids", []), *[
+                str(item.get("project_id") or "") for item in registrations
+            ]]
+        ))
+        project["registration_names"] = list(dict.fromkeys(
+            [*project.get("registration_names", []), *[
+                str(item.get("project_name") or "") for item in registrations
+            ]]
+        ))
+        project["registration_statuses"] = list(dict.fromkeys(
+            [*project.get("registration_statuses", []), *[
+                str(item.get("path_status") or "") for item in registrations
+            ]]
+        ))
+        project["exists"] = any(bool(item.get("exists")) for item in registrations)
+        if not project.get("project_name"):
+            project["project_name"] = str(registrations[0].get("project_name") or "")
+
+    # First-class projects can exist before any thread is assigned to them and
+    # can contain more than one root. Keep these projects visible without
+    # pretending that their IDs are legacy global-state registration IDs.
+    for native_project in native_projects:
+        roots = [str(value) for value in native_project.get("roots", [])]
+        primary_root = str(native_project.get("primary_root") or "")
+        identity = _project_path_identity(primary_root)
+        project = project_by_identity.get(identity) if identity else None
+        if project is None:
+            project_key = primary_root or f"@native:{native_project['project_id']}"
+            project = {
+                "path": primary_root,
+                "thread_ids": [],
+                "thread_count": 0,
+                "conversation_bytes": 0,
+                "image_bytes": 0,
+                "latest_updated_at": "",
+                "exists": bool(primary_root) and Path(primary_root).expanduser().is_dir(),
+            }
+            projects[project_key] = project
+            if identity:
+                project_by_identity[identity] = project
+        native_id = str(native_project["project_id"])
+        project["registered"] = True
+        project["project_id"] = native_id
+        project["project_name"] = str(native_project.get("project_name") or native_id)
+        project["native_project_ids"] = list(dict.fromkeys(
+            [*project.get("native_project_ids", []), native_id]
+        ))
+        project["project_roots"] = list(dict.fromkeys(
+            [*project.get("project_roots", []), *roots]
+        ))
+        project["storage_sources"] = list(dict.fromkeys(
+            [*project.get("storage_sources", []), "state_db"]
+        ))
+        project.setdefault("registration_ids", [])
+        project.setdefault("registration_names", [])
+        project.setdefault("registration_statuses", [])
+
+    for project in projects.values():
+        project.setdefault("project_name", project_name_from_path(str(project.get("path") or "")))
     project_values = list(projects.values())
     project_groups: dict[str, list[dict[str, Any]]] = {}
     for item in project_values:
-        name = Path(item["path"]).name.casefold()
+        name = (Path(item["path"]).name or item.get("project_name") or item.get("project_id") or "").casefold()
         base = re.sub(r"-from-old-computer(?:-\d+)?$", "", name)
         project_groups.setdefault(base, []).append(item)
     for group in project_groups.values():
@@ -679,6 +2500,8 @@ def scan_content(codex_home: Path) -> dict[str, Any]:
         "projects": sorted(project_values, key=lambda item: item["latest_updated_at"], reverse=True),
         "images": images,
         "consistency": consistency,
+        "path_health": path_health,
+        "compatibility": compatibility,
         "summary": {
             "conversations": len(conversations),
             "projects": len(projects),
@@ -691,6 +2514,9 @@ def scan_content(codex_home: Path) -> dict[str, Any]:
             "state_only": len(consistency["state_only_ids"]),
             "index_only": len(consistency["index_only_ids"]),
             "orphan_rollouts": len(consistency["orphan_rollout_ids"]),
+            "extended_rollout_paths": len(path_health["extended_paths"]),
+            "repairable_rollout_paths": len(path_health["repairable_paths"]),
+            "rollout_path_triggers": len(path_health["normalization_triggers"]),
         },
     }
 
@@ -814,6 +2640,9 @@ def clean_images(
     if require_codex_closed and migration_bundle.codex_is_running():
         raise ValueError("Codex is running. Close Codex completely before cleaning images")
     codex_home = codex_home.expanduser().resolve()
+    codex_compat.require_operation_supported(
+        codex_home, "conversation_content", "清理图片"
+    )
     rows = _read_thread_rows(codex_home)
     paths = []
     for task_id in selections:
@@ -870,6 +2699,84 @@ def clean_images(
     finally:
         os.close(descriptor)
         lock_path.unlink(missing_ok=True)
+
+
+def archive_projects(
+    codex_home: Path,
+    projects: list[dict[str, Any]],
+    require_codex_closed: bool = True,
+) -> dict[str, Any]:
+    """Archive project folders and remove their sidebar registrations, preserving conversations."""
+    if require_codex_closed and migration_bundle.codex_is_running():
+        raise ValueError("Codex is running. Close Codex completely before archiving projects")
+    codex_home = codex_home.expanduser().resolve()
+    codex_compat.require_operation_supported(
+        codex_home, "project_registry", "项目移入回收区"
+    )
+    selected = []
+    registration_ids: list[str] = []
+    for item in projects:
+        path = _validate_project_path(Path(str(item.get("path") or "")))
+        selected.append(path)
+        registration_ids.extend(str(value) for value in item.get("registration_ids", []) if value)
+    selected = sorted(set(selected), key=lambda path: len(path.parts))
+    registration_ids = list(dict.fromkeys(registration_ids))
+    for index, parent in enumerate(selected):
+        if any(child.is_relative_to(parent) for child in selected[index + 1:]):
+            raise ValueError("Do not archive both a project directory and one of its subdirectories")
+
+    registration_backup = None
+    moved_items: list[str] = []
+    try:
+        if registration_ids:
+            registry_result = repair_rollout_path_health(
+                codex_home,
+                require_codex_closed=False,
+                remove_normalization_triggers=False,
+                selected_project_actions={
+                    f"registration:{project_id}": "delete" for project_id in registration_ids
+                },
+                repair_conversation_paths=False,
+            )
+            registration_backup = registry_result.get("backup_path")
+            if registry_result.get("project_registrations_removed", 0) != len(registration_ids):
+                raise ValueError("Project registration archive verification failed")
+        trash_result = move_projects_to_trash(selected, require_codex_closed=False)
+        moved_items = list(trash_result.get("items", []))
+        for item_value in moved_items:
+            manifest_path = Path(item_value) / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest.update({
+                "operation": "project_archive",
+                "codex_home": str(codex_home),
+                "registration_backup": registration_backup,
+                "registration_ids": registration_ids,
+            })
+            migration_bundle.atomic_write(
+                manifest_path,
+                (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+            )
+        return {
+            "archived": len(moved_items),
+            "registration_removed": len(registration_ids),
+            "registration_backup": registration_backup,
+            "trash_root": trash_result["trash_root"],
+            "items": moved_items,
+        }
+    except Exception:
+        for item_value in reversed(moved_items):
+            try:
+                restore_project(Path(item_value), require_codex_closed=False)
+            except Exception:
+                pass
+        if registration_backup:
+            try:
+                migration_bundle.restore_backup(
+                    Path(registration_backup), codex_home, require_codex_closed=False
+                )
+            except Exception:
+                pass
+        raise
 
 
 def _remove_index_rows(codex_home: Path, task_ids: set[str]) -> None:
@@ -1020,6 +2927,9 @@ def set_conversations_archived(
     if require_codex_closed and migration_bundle.codex_is_running():
         raise ValueError("Codex is running. Close Codex completely before changing archive state")
     codex_home = codex_home.expanduser().resolve()
+    codex_compat.require_operation_supported(
+        codex_home, "thread_lifecycle", "更改对话归档状态"
+    )
     database = migration_bundle.find_state_db(codex_home)
     if database is None:
         raise ValueError("Codex thread database was not found")
@@ -1183,6 +3093,9 @@ def delete_conversations(codex_home: Path, task_ids: set[str], require_codex_clo
     if require_codex_closed and migration_bundle.codex_is_running():
         raise ValueError("Codex is running. Close Codex completely before deleting conversations")
     codex_home = codex_home.expanduser().resolve()
+    codex_compat.require_operation_supported(
+        codex_home, "thread_lifecycle", "删除对话"
+    )
     database = migration_bundle.find_state_db(codex_home)
     if database is None:
         raise ValueError("Codex thread database was not found")
@@ -1257,6 +3170,9 @@ def clean_stale_sidebar_entries(
     if require_codex_closed and migration_bundle.codex_is_running():
         raise ValueError("Codex is running. Close Codex completely before cleaning sidebar entries")
     codex_home = codex_home.expanduser().resolve()
+    codex_compat.require_operation_supported(
+        codex_home, "sidebar_cleanup", "清理侧栏残留"
+    )
     catalog_database, catalog_rows = _read_thread_catalog(codex_home)
     if catalog_database is None:
         raise ValueError("Codex sidebar catalog was not found")
@@ -1388,7 +3304,11 @@ def list_project_trash() -> list[dict[str, Any]]:
     return sorted(results, key=lambda item: item.get("created_at", ""), reverse=True)
 
 
-def restore_project(item_root: Path, require_codex_closed: bool = True) -> dict[str, Any]:
+def restore_project(
+    item_root: Path,
+    require_codex_closed: bool = True,
+    codex_home: Path | None = None,
+) -> dict[str, Any]:
     if require_codex_closed and migration_bundle.codex_is_running():
         raise ValueError("Codex is running. Close Codex completely before restoring a project directory")
     item_root = item_root.expanduser().resolve()
@@ -1399,12 +3319,65 @@ def restore_project(item_root: Path, require_codex_closed: bool = True) -> dict[
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     source = item_root / "project"
     target = Path(manifest["original_path"]).expanduser().resolve()
+    operation = manifest.get("operation")
+    full_delete = operation == "full_project_delete"
+    restore_registration = operation in {"full_project_delete", "project_archive"}
+    if codex_home is not None and restore_registration:
+        codex_compat.require_operation_supported(
+            codex_home, "project_registry", "恢复项目注册"
+        )
+        if full_delete:
+            codex_compat.require_operation_supported(
+                codex_home, "conversation_import", "恢复项目对话"
+            )
+    if full_delete and target.exists():
+        raise ValueError("The original project directory already exists; full-project recovery cannot overwrite it")
     if target.exists():
         target = target.with_name(f"{target.name}-restored-{_now_stamp()}")
     target.parent.mkdir(parents=True, exist_ok=True)
+    guard_backups: list[str] = []
     shutil.move(str(source), str(target))
-    manifest["status"] = "restored"
-    manifest["restored_path"] = str(target)
-    manifest["restored_at"] = migration_bundle.now_iso()
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    return {"restored_path": str(target)}
+    try:
+        if restore_registration:
+            effective_codex_home = (
+                codex_home.expanduser().resolve()
+                if codex_home is not None else
+                Path(manifest["codex_home"]).expanduser().resolve()
+            )
+            if str(effective_codex_home) != str(Path(manifest["codex_home"]).expanduser().resolve()):
+                raise ValueError("This project deletion belongs to a different Codex data directory")
+            backup_keys = ("conversation_backup", "registration_backup") if full_delete else ("registration_backup",)
+            for backup_key in backup_keys:
+                backup_value = manifest.get(backup_key)
+                if not backup_value:
+                    continue
+                restored = migration_bundle.restore_backup(
+                    Path(backup_value), effective_codex_home, require_codex_closed=False
+                )
+                guard_backups.append(restored["safety_backup_path"])
+        manifest["status"] = "restored"
+        manifest["restored_path"] = str(target)
+        manifest["restored_at"] = migration_bundle.now_iso()
+        migration_bundle.atomic_write(
+            manifest_path,
+            (json.dumps(manifest, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+        )
+        return {
+            "restored_path": str(target),
+            "full_project_restored": full_delete,
+            "registration_restored": restore_registration and bool(manifest.get("registration_backup")),
+            "restored_layers": len(guard_backups),
+        }
+    except Exception:
+        effective_codex_home = codex_home.expanduser().resolve() if codex_home is not None else None
+        if effective_codex_home is not None:
+            for backup_value in reversed(guard_backups):
+                try:
+                    migration_bundle.restore_backup(
+                        Path(backup_value), effective_codex_home, require_codex_closed=False
+                    )
+                except Exception:
+                    pass
+        if target.exists() and not source.exists():
+            shutil.move(str(target), str(source))
+        raise

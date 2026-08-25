@@ -84,6 +84,48 @@ class SimpleGuiLayoutTests(unittest.TestCase):
         orientations = {str(scrollbar.cget("orient")) for scrollbar in scrollbars if scrollbar.winfo_ismapped()}
         self.assertEqual(orientations, {"vertical", "horizontal"})
 
+    def test_content_manager_size_heading_sorts_by_bytes_and_toggles_direction(self):
+        self.app.show_content_manager()
+        tree = self.app.conversation_tree
+        tree.insert("", "end", iid="small", values=("small", "p", "c", "x", "", "900.0 KB", "0 B", "", ""))
+        tree.insert("", "end", iid="large", values=("large", "p", "c", "x", "", "10.0 MB", "0 B", "", ""))
+        tree.insert("", "end", iid="medium", values=("medium", "p", "c", "x", "", "2.0 MB", "0 B", "", ""))
+
+        self.app._sort_manager_tree(tree, "size")
+
+        self.assertEqual(tree.get_children(), ("small", "medium", "large"))
+        self.assertEqual(tree.heading("size", "text"), "大小 ↑")
+
+        self.app._sort_manager_tree(tree, "size")
+
+        self.assertEqual(tree.get_children(), ("large", "medium", "small"))
+        self.assertEqual(tree.heading("size", "text"), "大小 ↓")
+
+    def test_content_manager_reapplies_size_sort_after_filter_refresh(self):
+        self.app.show_content_manager()
+        self.app.manager_project_filter_paths = {"全部项目": None}
+        self.app.manager_project_filter.set("全部项目")
+        self.app.manager_conversations = {
+            "large": {
+                "task_id": "large", "title": "large", "project_name": "p", "provider": "c",
+                "project_path": "x", "updated_at": "2026-08-25T00:00:00", "size_bytes": 10 * 1024 ** 2,
+                "image_bytes": 0, "archived": False,
+            },
+            "small": {
+                "task_id": "small", "title": "small", "project_name": "p", "provider": "c",
+                "project_path": "x", "updated_at": "2026-08-24T00:00:00", "size_bytes": 900 * 1024,
+                "image_bytes": 0, "archived": False,
+            },
+        }
+        self.app.manager_inventory = {"consistency": {"stale_catalog": []}}
+        self.app.conversation_tree.manager_sort_column = "size"
+        self.app.conversation_tree.manager_sort_descending = True
+
+        self.app.filter_managed_conversations()
+
+        self.assertEqual(self.app.conversation_tree.get_children(), ("large", "small"))
+        self.assertEqual(self.app.conversation_tree.heading("size", "text"), "大小 ↓")
+
     def test_provider_mode_refresh_preserves_current_owner_column(self):
         self.app.load_local_agents = lambda: None
         self.app.refresh_backup_summary = lambda: None
@@ -153,7 +195,7 @@ class SimpleGuiLayoutTests(unittest.TestCase):
 
     def test_project_import_requires_a_check_before_starting(self):
         self.app.show_project_transfer()
-        self._assert_buttons_visible({"我在旧电脑：导出项目", "我在新电脑：导入项目"})
+        self._assert_buttons_visible({"我在旧电脑：导出", "我在新电脑：检查并导入"})
         self.app.show_project_import()
         self._assert_buttons_visible({"检查项目迁移包", "开始导入项目"})
         buttons = {
@@ -162,11 +204,30 @@ class SimpleGuiLayoutTests(unittest.TestCase):
             if child.winfo_class() == "TButton"
         }
         self.assertEqual(str(buttons["开始导入项目"].cget("state")), "disabled")
+        checkbuttons = {
+            child.cget("text")
+            for child in self._walk(self.app)
+            if child.winfo_class() == "TCheckbutton"
+        }
+        self.assertIn("导入项目文件", checkbuttons)
+        self.app.project_import_notebook.select(1)
+        self._assert_buttons_visible({"全选", "全不选", "反选"})
+
+    def test_home_combines_cross_computer_project_and_conversation_transfer(self):
+        self.app.show_home()
+        labels = {
+            child.cget("text")
+            for child in self._walk(self.app)
+            if child.winfo_class() == "TButton"
+        }
+        self.assertIn("两台电脑之间传输", labels)
+        self.assertNotIn("迁移到另一台电脑", labels)
+        self.assertNotIn("导入旧电脑项目", labels)
 
     def test_content_manager_has_separate_conversation_project_and_image_controls(self):
         self.app.show_content_manager()
         self._assert_buttons_visible({
-            "扫描内容", "预览对话", "归档所选", "复原所选归档", "备份并删除所选对话"
+            "扫描内容", "修复路径问题", "预览对话", "归档所选", "复原所选归档", "备份并删除所选对话"
         })
         self.app.manager_notebook.select(1)
         self._assert_buttons_visible({"删除关联对话", "项目移入回收区", "恢复最近移除项目"})
@@ -176,9 +237,82 @@ class SimpleGuiLayoutTests(unittest.TestCase):
         self.assertEqual(str(self.app.manager_preview_conversation_button.cget("state")), "disabled")
         self.assertEqual(str(self.app.manager_archive_conversations_button.cget("state")), "disabled")
         self.assertEqual(str(self.app.manager_unarchive_conversations_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.manager_repair_paths_button.cget("state")), "disabled")
         self.assertEqual(str(self.app.manager_project_filter_combo.cget("state")), "disabled")
         self.assertEqual(str(self.app.manager_clean_images_button.cget("state")), "disabled")
         self.assertTrue(self.app.conversation_tree.bind("<Double-1>"))
+
+    def test_project_registration_buttons_follow_capabilities_not_status_labels(self):
+        capabilities = {
+            "details": {"enabled": True, "reason": "details"},
+            "keep": {"enabled": True, "reason": "keep"},
+            "normalize": {"enabled": True, "reason": "verified"},
+            "repoint": {"enabled": True, "reason": "repoint"},
+            "rename": {"enabled": True, "reason": "rename"},
+            "delete": {"enabled": False, "reason": "unknown reference"},
+            "full_delete": {"enabled": False, "reason": "shared directory"},
+        }
+        health = {
+            "actionable_project_registrations": [{
+                "project_id": "project-1",
+                "project_name": "demo",
+                "status": "普通路径",
+                "roots": [{
+                    "raw_path": r"C:\projects\demo",
+                    "normalized_path": r"C:\projects\demo",
+                    "path_kind": "ordinary",
+                    "exists": True,
+                }],
+                "linked_tasks": 0,
+                "known_reference_count": 0,
+                "recommended_action": "keep",
+                "related_tasks": [],
+                "capabilities": capabilities,
+            }],
+            "repairable_paths": [],
+            "normalization_triggers": [],
+        }
+        observed = {}
+
+        def inspect_dialog():
+            windows = [child for child in self.app.winfo_children() if child.winfo_class() == "Toplevel"]
+            self.assertTrue(windows)
+            window = windows[-1]
+            buttons = {
+                child.cget("text"): child
+                for child in self._walk(window)
+                if child.winfo_class() == "TButton"
+            }
+            observed["normalize"] = str(buttons["修复路径"].cget("state"))
+            observed["delete"] = str(buttons["删除注册"].cget("state"))
+            observed["full_delete"] = str(buttons["彻底删除项目"].cget("state"))
+            buttons["取消"].invoke()
+
+        self.app.after(50, inspect_dialog)
+        result = self.app.choose_path_repair_actions(health)
+
+        self.assertIsNone(result)
+        self.assertEqual(observed["normalize"], "normal")
+        self.assertEqual(observed["delete"], "disabled")
+        self.assertEqual(observed["full_delete"], "disabled")
+
+    def test_rollout_only_path_repair_does_not_open_empty_project_dialog(self):
+        self.app.show_content_manager()
+        self.app.manager_inventory = {
+            "path_health": {
+                "repairable_paths": [{"task_id": "task-1"}],
+                "blocked_paths": [],
+                "normalization_triggers": ["threads_rollout_path_normalize_after_insert"],
+                "actionable_project_registrations": [],
+            },
+        }
+        self.app.manager_codex_home.set(str(Path(self.temporary.name) / ".codex"))
+        with mock.patch.object(self.app, "choose_path_repair_actions") as choose_dialog, \
+             mock.patch.object(simple_sync_gui.messagebox, "askyesno", return_value=False) as confirm:
+            self.app.repair_managed_rollout_paths()
+
+        choose_dialog.assert_not_called()
+        confirm.assert_called_once()
 
     def test_content_manager_can_repair_a_partial_archive_state(self):
         self.app.show_content_manager()
@@ -287,6 +421,15 @@ class SimpleGuiLayoutTests(unittest.TestCase):
                 "orphan_rollout_ids": [],
                 "missing_file_ids": [],
             },
+            "path_health": {
+                "extended_paths": [],
+                "repairable_paths": [],
+                "blocked_paths": [],
+                "normalization_triggers": [
+                    "threads_rollout_path_normalize_after_insert",
+                    "threads_rollout_path_normalize_after_update",
+                ],
+            },
             "summary": {
                 "conversations": 3,
                 "projects": 2,
@@ -309,6 +452,8 @@ class SimpleGuiLayoutTests(unittest.TestCase):
         self.assertEqual(len(self.app.image_manager_tree.get_children()), 1)
         self.assertEqual({self.app.conversation_tree.item(item, "values")[1] for item in children}, {"alpha"})
         self.assertIn("当前项目显示 1 个，已隐藏归档 1 个", self.app.manager_summary.get())
+        self.assertIn("遗留触发器 2 个", self.app.manager_path_health.get())
+        self._assert_buttons_visible({"修复路径问题", "清理侧栏残留", "一致性报告"})
 
         self.app.manager_hide_archived.set(False)
         self.app.toggle_managed_archived_visibility()
@@ -316,6 +461,181 @@ class SimpleGuiLayoutTests(unittest.TestCase):
         self.assertEqual(len(self.app.conversation_tree.get_children()), 2)
         self.assertEqual(len(self.app.image_manager_tree.get_children()), 2)
         self.assertEqual(self.app.manager_project_filter.get(), "alpha (可用 2，残留 1)")
+
+    def test_registered_empty_project_is_visible_in_tree_and_filter(self):
+        self.app.show_content_manager()
+        project_path = r"C:\Users\ZZT\Documents\Codex\conversation-demo-project"
+        self.app.complete_content_scan({
+            "conversations": [],
+            "projects": [{
+                "path": project_path,
+                "thread_count": 0,
+                "conversation_bytes": 0,
+                "image_bytes": 0,
+                "latest_updated_at": "",
+                "exists": True,
+                "registered": True,
+                "project_name": "conversation-demo-project",
+                "registration_ids": ["project-without-chat"],
+                "registration_names": ["conversation-demo-project"],
+                "registration_statuses": ["扩展路径"],
+                "possible_duplicates": 0,
+            }],
+            "images": [],
+            "consistency": {
+                "catalog_available": False,
+                "catalog_visible": 0,
+                "stale_catalog": [],
+                "stale_catalog_ids": [],
+                "state_only_ids": [],
+                "index_only_ids": [],
+                "orphan_rollout_ids": [],
+                "missing_file_ids": [],
+            },
+            "path_health": {
+                "extended_paths": [],
+                "repairable_paths": [],
+                "blocked_paths": [],
+                "normalization_triggers": [],
+                "project_extended_paths": [],
+                "repairable_project_paths": [],
+                "duplicate_projects": [],
+                "blocked_duplicate_projects": [],
+                "blocked_project_paths": [],
+                "removable_projects": [],
+                "actionable_project_registrations": [],
+            },
+            "summary": {
+                "conversations": 0,
+                "projects": 1,
+                "unique_images": 0,
+                "image_occurrences": 0,
+                "image_bytes": 0,
+                "missing_files": 0,
+                "catalog_visible": 0,
+                "stale_catalog": 0,
+                "state_only": 0,
+                "index_only": 0,
+                "orphan_rollouts": 0,
+                "extended_rollout_paths": 0,
+                "repairable_rollout_paths": 0,
+                "rollout_path_triggers": 0,
+            },
+        })
+
+        self.assertEqual(len(self.app.project_manager_tree.get_children()), 1)
+        project_values = self.app.project_manager_tree.item(
+            self.app.project_manager_tree.get_children()[0], "values"
+        )
+        self.assertEqual(project_values[0], project_path)
+        self.assertEqual(project_values[1], "0")
+        self.assertEqual(project_values[5], "已注册，暂无聊天")
+        labels = tuple(self.app.manager_project_filter_combo.cget("values"))
+        self.assertIn("conversation-demo-project (已注册，暂无聊天)", labels)
+        self.app.manager_project_filter.set("conversation-demo-project (已注册，暂无聊天)")
+        self.app.filter_managed_conversations()
+        self.assertEqual(self.app.conversation_tree.get_children(), ())
+        self.assertIn("当前项目显示 0 个", self.app.manager_summary.get())
+
+    def test_unknown_codex_schema_keeps_preview_but_disables_mutations(self):
+        self.app.show_content_manager()
+        self.app.complete_content_scan({
+            "conversations": [],
+            "projects": [],
+            "images": [],
+            "consistency": {
+                "catalog_available": False,
+                "catalog_visible": 0,
+                "stale_catalog": [],
+                "stale_catalog_ids": [],
+                "state_only_ids": [],
+                "index_only_ids": [],
+                "orphan_rollout_ids": [],
+                "missing_file_ids": [],
+            },
+            "path_health": {
+                "extended_paths": [],
+                "repairable_paths": [{"task_id": "task-1"}],
+                "blocked_paths": [],
+                "normalization_triggers": [],
+                "project_extended_paths": [],
+                "repairable_project_paths": [],
+                "duplicate_projects": [],
+                "blocked_duplicate_projects": [],
+                "blocked_project_paths": [],
+                "removable_projects": [],
+                "actionable_project_registrations": [],
+            },
+            "compatibility": {
+                "status": "read_only",
+                "write_compatible": False,
+                "blockers": ["状态数据库协议 51 高于已验证上限 50"],
+                "warnings": [],
+                "state_schema_version": 51,
+                "history_schema_version": 4,
+                "project_storage_mode": "state_db",
+            },
+            "summary": {
+                "conversations": 0,
+                "projects": 0,
+                "unique_images": 0,
+                "image_occurrences": 0,
+                "image_bytes": 0,
+                "missing_files": 0,
+                "catalog_visible": 0,
+                "stale_catalog": 0,
+            },
+        })
+
+        self.assertIn("只读保护", self.app.manager_compatibility.get())
+        self.assertEqual(str(self.app.manager_repair_paths_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.manager_delete_conversations_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.manager_clean_images_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.manager_consistency_button.cget("state")), "normal")
+
+    def test_partial_codex_schema_locks_only_unsupported_mutations(self):
+        self.app.show_content_manager()
+        self.app.complete_content_scan({
+            "conversations": [], "projects": [], "images": [],
+            "consistency": {
+                "catalog_available": True, "catalog_visible": 0,
+                "stale_catalog": [], "stale_catalog_ids": [],
+                "state_only_ids": [], "index_only_ids": [],
+                "orphan_rollout_ids": [], "missing_file_ids": [],
+            },
+            "path_health": {
+                "extended_paths": [], "repairable_paths": [{"task_id": "task-1"}],
+                "blocked_paths": [], "normalization_triggers": [],
+                "project_extended_paths": [], "repairable_project_paths": [],
+                "duplicate_projects": [], "blocked_duplicate_projects": [],
+                "blocked_project_paths": [], "removable_projects": [],
+                "actionable_project_registrations": [],
+            },
+            "compatibility": {
+                "status": "partial", "write_compatible": True,
+                "blockers": [], "warnings": [], "state_schema_version": 50,
+                "history_schema_version": 4, "project_storage_mode": "transitioning",
+                "operation_capabilities": {
+                    "path_repair": True, "sidebar_cleanup": True,
+                    "conversation_content": False, "thread_lifecycle": False,
+                    "conversation_import": False, "project_registry": True,
+                    "full_project_delete": False,
+                },
+            },
+            "summary": {
+                "conversations": 0, "projects": 0, "unique_images": 0,
+                "image_occurrences": 0, "image_bytes": 0, "missing_files": 0,
+                "catalog_visible": 0, "stale_catalog": 0,
+            },
+        })
+
+        self.assertIn("部分写入受限", self.app.manager_compatibility.get())
+        self.assertEqual(str(self.app.manager_repair_paths_button.cget("state")), "normal")
+        self.assertEqual(str(self.app.manager_clean_stale_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.manager_archive_conversations_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.manager_delete_conversations_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.manager_clean_images_button.cget("state")), "disabled")
+        self.assertEqual(str(self.app.manager_consistency_button.cget("state")), "normal")
 
     def test_background_operations_complete_on_the_tk_thread(self):
         main_thread = threading.get_ident()
